@@ -7,25 +7,31 @@ from datetime import datetime, timezone
 import aiohttp
 import ccxt.async_support as ccxt
 import ccxt.pro as ccxtpro
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ==========================================
-# 1. 설정 및 상수 정의
+# 0. .env 환경변수 파일 자동 로드
+# ==========================================
+load_dotenv()
+
+# ==========================================
+# 1. 설정 및 상수 정의 (.env 자동 연동)
 # ==========================================
 OKX_CONFIG = {
-    'apiKey': 'YOUR_API_KEY',
-    'secret': 'YOUR_SECRET_KEY',
-    'password': 'YOUR_PASSPHRASE',
+    'apiKey': os.getenv('OKX_API_KEY'),
+    'secret': os.getenv('OKX_SECRET_KEY'),
+    'password': os.getenv('OKX_PASSPHRASE'),
     'enableRateLimit': True,
     'options': {
         'defaultType': 'swap',
     }
 }
 
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
-TELEGRAM_ADMIN_ID = 123456789  # 본인의 Telegram User ID (정수) 입력
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+TELEGRAM_ADMIN_ID = int(os.getenv('TELEGRAM_ADMIN_ID', 0))
 
 # 트레이딩 파라미터
 LEVERAGE = 3                     # 레버리지 3배
@@ -101,11 +107,11 @@ class DeltaNeutralBot:
         self.entry_swap_price = 0.0
         self.initial_equity_usdt = 0.0    # 진입 시점 총 자산
         self.liquidation_price = 0.0
-        self.entry_timestamp = 0.0        # 💡 포지션 진입 시각 (수수료 방어용)
+        self.entry_timestamp = 0.0        # 포지션 진입 시각
         self.trade_lock = asyncio.Lock()
 
     def save_state(self):
-        """원자적(Atomic) 파일 쓰기로 파일 손상 방지"""
+        """원자적(Atomic) 파일 쓰기"""
         state = {
             "current_symbol": self.current_symbol,
             "current_swap_symbol": self.current_swap_symbol,
@@ -197,7 +203,6 @@ class DeltaNeutralBot:
                 next_funding_time = int(next_funding_ts) / 1000.0
                 now_ts = time.time()
                 diff_seconds = abs(next_funding_time - now_ts)
-                # 펀딩비 지급 전후 5분간 스왑/교체 차단
                 if diff_seconds <= 300 or (now_ts > next_funding_time and (now_ts - next_funding_time) <= 300):
                     return True
         except Exception as e:
@@ -205,7 +210,6 @@ class DeltaNeutralBot:
         return False
 
     def amount_to_contracts(self, swap_symbol, coin_amount):
-        """코인 수량을 선물 계약(Contract) 수량으로 정밀 변환"""
         market = self.exchange_rest.market(swap_symbol)
         contract_size = float(market.get('contractSize', 1.0))
         raw_contracts = coin_amount / contract_size
@@ -213,7 +217,6 @@ class DeltaNeutralBot:
         return float(contracts_str)
 
     async def ensure_trading_balance(self):
-        """Funding 계좌 -> Trading 계좌 자동 잔고 이체"""
         try:
             balance = await self.exchange_rest.fetch_balance()
             trading_usdt = float(balance.get('USDT', {}).get('free', 0.0))
@@ -230,7 +233,6 @@ class DeltaNeutralBot:
             logger.warning(f"Auto-transfer check note: {e}")
 
     async def get_total_equity_usdt(self) -> float:
-        """현재 총 평가 자산(USDT) 정밀 산출"""
         try:
             balance = await self.exchange_rest.fetch_balance()
             total_usdt = float(balance.get('USDT', {}).get('total', 0.0))
@@ -247,7 +249,6 @@ class DeltaNeutralBot:
             return 0.0
 
     async def check_slippage(self, symbol: str, side: str, amount: float) -> bool:
-        """오더북 깊이 심도 분석 및 슬리피지 예방"""
         try:
             orderbook = await self.exchange_rest.fetch_order_book(symbol, limit=20)
             orders = orderbook['asks'] if side == 'buy' else orderbook['bids']
@@ -283,9 +284,7 @@ class DeltaNeutralBot:
             return False
 
     async def execute_pure_maker_chasing_order(self, symbol: str, side: str, amount: float, is_swap: bool = False):
-        """💡 [100% 지정가(Maker) 전용 Chasing 로직]
-        시장가(Taker) 수수료 차출을 절대 허용하지 않고 100% postOnly 지정가로만 체결 시도.
-        """
+        """100% 지정가(Maker) 전용 Chasing 주문"""
         remaining_amt = amount
         total_filled = 0.0
         
@@ -294,14 +293,13 @@ class DeltaNeutralBot:
                 break
                 
             orderbook = await self.exchange_rest.fetch_order_book(symbol, limit=5)
-            # Maker 체결을 위해 최우선 호가(Best Bid/Ask)에 주문 배치
             price = orderbook['bids'][0][0] if side == 'buy' else orderbook['asks'][0][0]
             
             amt_str = self.exchange_rest.amount_to_precision(symbol, remaining_amt)
             if float(amt_str) <= 0:
                 break
 
-            params = {'postOnly': True}  # 지정가(Maker) 강제 지정 옵션
+            params = {'postOnly': True}
             if is_swap:
                 params['posMode'] = 'net'
                 
@@ -317,7 +315,6 @@ class DeltaNeutralBot:
                 if remaining_amt > 0:
                     await self.exchange_rest.cancel_order(order['id'], symbol)
             except Exception as e:
-                # postOnly 거부(즉시 체결 위험 시 취소됨) 또는 오더북 이탈 시 조용히 다음 시도
                 logger.debug(f"Maker order retry ({attempt+1}/{CHASE_RETRY_LIMIT}): {e}")
                 await asyncio.sleep(0.3)
 
@@ -368,7 +365,6 @@ class DeltaNeutralBot:
             logger.warning(f"Could not cancel open orders for {symbol}: {e}")
 
     async def close_all_positions(self):
-        """현물 및 선물 포지션 전량 청산 (100% 지정가 시도 후 안전 정리)"""
         async with self.trade_lock:
             if not self.current_symbol or not self.current_swap_symbol:
                 return
@@ -386,7 +382,6 @@ class DeltaNeutralBot:
 
                 close_tasks = []
 
-                # 1. 선물 숏 포지션 청산 (지정가 Maker 우선)
                 if isinstance(positions, list):
                     for pos in positions:
                         contracts = float(pos.get('contracts', 0))
@@ -395,7 +390,6 @@ class DeltaNeutralBot:
                                 self.execute_pure_maker_chasing_order(swap_symbol, 'buy', contracts, is_swap=True)
                             )
 
-                # 2. 현물 매도 청산 (지정가 Maker 우선)
                 base_currency = symbol.split('/')[0]
                 if isinstance(balance, dict):
                     spot_amount = float(balance.get(base_currency, {}).get('free', 0))
@@ -412,7 +406,6 @@ class DeltaNeutralBot:
                 if close_tasks:
                     await asyncio.gather(*close_tasks, return_exceptions=True)
 
-                # 💡 잔여 미체결분 확인 후 최종 마감 (안전 세이프가드)
                 balance_after = await self.exchange_rest.fetch_balance()
                 rem_spot = float(balance_after.get(base_currency, {}).get('free', 0))
                 if rem_spot > 0:
@@ -435,7 +428,6 @@ class DeltaNeutralBot:
                 await self.notifier.send_message(f"❌ **청산 중 오류 발생**: {e}")
 
     async def open_position(self, target_opportunity, total_usdt_balance):
-        """100% 지정가(Maker) 및 정밀 델타 보정으로 진입"""
         async with self.trade_lock:
             await self.ensure_trading_balance()
             
@@ -466,7 +458,6 @@ class DeltaNeutralBot:
                     logger.warning("Calculated swap contracts is 0. Aborting entry.")
                     return
 
-                # 슬리피지 사전 체크
                 spot_ok = await self.check_slippage(symbol, 'buy', spot_amount_final)
                 swap_ok = await self.check_slippage(swap_symbol, 'sell', swap_contracts)
 
@@ -474,21 +465,18 @@ class DeltaNeutralBot:
                     await self.notifier.send_message(f"⚠️ **[{symbol}] 슬리피지 한도 초과/오더북 깊이 부족으로 진입 취소**")
                     return
 
-                # 💡 1단계: 100% Maker 지정가 현물 매수
                 actual_spot_filled = await self.execute_pure_maker_chasing_order(symbol, 'buy', spot_amount_final, is_swap=False)
                 
                 if actual_spot_filled <= 0:
                     logger.warning("Spot Maker order was not filled. Cancelling entry to save fees.")
                     return
 
-                # 💡 2단계: 실제로 체결된 현물 수량에 정확히 맞춰 100% Maker 선물 숏 진입
                 exact_swap_contracts = self.amount_to_contracts(swap_symbol, actual_spot_filled)
                 
                 actual_swap_filled = 0.0
                 if exact_swap_contracts > 0:
                     actual_swap_filled = await self.execute_pure_maker_chasing_order(swap_symbol, 'sell', exact_swap_contracts, is_swap=True)
 
-                # 3단계: 불일치 미세 보정 (Rebalancing)
                 balance = await self.exchange_rest.fetch_balance()
                 base_curr = symbol.split('/')[0]
                 real_spot_holding = float(balance.get(base_curr, {}).get('free', 0.0))
@@ -513,7 +501,6 @@ class DeltaNeutralBot:
                         else:
                             await self.execute_pure_maker_chasing_order(swap_symbol, 'buy', float(diff_str), is_swap=True)
 
-                # 청산가 및 포지션 정보 업데이트
                 positions = await self.exchange_rest.fetch_positions([swap_symbol])
                 liq_price = 0.0
                 for pos in positions:
@@ -529,7 +516,7 @@ class DeltaNeutralBot:
                 self.entry_swap_price = float(ticker_swap['last'])
                 self.liquidation_price = liq_price
                 self.initial_equity_usdt = await self.get_total_equity_usdt()
-                self.entry_timestamp = time.time()  # 진입 시점 기록
+                self.entry_timestamp = time.time()
                 self.save_state()
 
                 await self.notifier.send_message(
@@ -548,7 +535,6 @@ class DeltaNeutralBot:
                 await self.close_all_positions()
 
     async def run_websocket_stop_loss(self):
-        """WebSocket 기반 실시간 리스크 및 손절 모니터링"""
         last_equity_check_time = 0
         cached_equity = 0.0
 
@@ -561,7 +547,6 @@ class DeltaNeutralBot:
                     current_swap_price = float(ticker.get('last', 0) or 0)
 
                     if current_swap_price > 0:
-                        # 1. 강제청산가 접근 감시
                         if self.liquidation_price > 0:
                             dist_to_liq = (self.liquidation_price - current_swap_price) / current_swap_price
                             if dist_to_liq <= LIQUIDATION_BUFFER_PCT:
@@ -572,7 +557,6 @@ class DeltaNeutralBot:
                                 await asyncio.sleep(5)
                                 continue
 
-                        # 2. 괴리율(Basis Divergence) 감시
                         basis_change = abs(current_swap_price - self.entry_swap_price) / self.entry_swap_price
                         if basis_change >= MAX_BASIS_DIVERGENCE_PCT:
                             await self.notifier.send_message(
@@ -582,7 +566,6 @@ class DeltaNeutralBot:
                             await asyncio.sleep(5)
                             continue
 
-                        # 3. 계정 총 자산 손실 감시 (10초 주기 캐싱)
                         now_ts = time.time()
                         if now_ts - last_equity_check_time > 10:
                             cached_equity = await self.get_total_equity_usdt()
@@ -606,7 +589,6 @@ class DeltaNeutralBot:
                 await asyncio.sleep(3)
 
     async def run_screening_loop(self):
-        """펀딩비 탐색 및 수수료 방어형 스위칭 메인 루프"""
         await self.notifier.send_message("🤖 **수수료 극소화형 델타 뉴트럴 자동 매매 봇 가동 시작**")
         
         while True:
@@ -628,7 +610,6 @@ class DeltaNeutralBot:
                                 await self.open_position(best_opp, usdt_free)
 
                         elif best_opp['symbol'] != self.current_symbol:
-                            # 💡 [수수료 누수 방어 1]: 최소 포지션 유지 시간(8시간) 미달 시 스위칭 차단
                             held_duration = time.time() - self.entry_timestamp
                             if held_duration < MIN_HOLD_TIME_SECONDS:
                                 logger.info(f"Position held for {held_duration/3600:.2f}h < 8h. Skipping rotation to save fees.")
@@ -639,7 +620,6 @@ class DeltaNeutralBot:
                             curr_funding_info = await self.exchange_rest.fetch_funding_rate(curr_swap)
                             curr_funding = float(curr_funding_info.get('fundingRate', 0) or 0)
                             
-                            # 💡 [수수료 누수 방어 2]: 신규 종목 펀딩비가 기존 대비 50% 이상 우수할 때만 교체
                             if best_opp['funding_rate'] > curr_funding * ROTATION_THRESHOLD_SCORE:
                                 await self.notifier.send_message(
                                     f"🔄 **수수료 대비 고수익 종목 교체**: {self.current_symbol} -> {best_opp['symbol']}\n"
