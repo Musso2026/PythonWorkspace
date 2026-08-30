@@ -2,6 +2,7 @@ import asyncio
 import logging
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
 import aiohttp
@@ -34,28 +35,28 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 TELEGRAM_ADMIN_ID = int(os.getenv('TELEGRAM_ADMIN_ID', 0))
 
 # 트레이딩 파라미터
-LEVERAGE = 3                     # 레버리지 3배
-MIN_FUNDING_RATE = 0.0001        # 최소 펀딩비 (0.01%)
-MIN_VOLUME_24H_USD = 10_000_000  # 최소 24시간 거래량 ($10,000,000)
-MIN_ORDER_USDT = 10.0            # 최소 주문 금액 세이프가드 ($10)
-BALANCE_USAGE_RATIO = 0.90       # 증거금 안전을 위해 가용 USDT의 90%만 투입
-SPOT_FEE_RATE = 0.0015           # 현물 매수 수수료 버퍼 안전하게 0.15% 설정
+LEVERAGE = 3                      # 레버리지 3배
+MIN_FUNDING_RATE = 0.0001         # 최소 펀딩비 (0.01%)
+MIN_VOLUME_24H_USD = 10_000_000   # 최소 24시간 거래량 ($10,000,000)
+MIN_ORDER_USDT = 10.0             # 최소 주문 금액 세이프가드 ($10)
+BALANCE_USAGE_RATIO = 0.90        # 증거금 안전을 위해 가용 USDT의 90%만 투입
+SPOT_FEE_RATE = 0.0015            # 현물 매수 수수료 버퍼 안전하게 0.15% 설정
 
 # 💡 [수수료 절감 최적화 파라미터]
-ROTATION_THRESHOLD_SCORE = 1.5   # 신규 종목 펀딩비가 기존 대비 50% 이상 높을 때만 스위칭 (수수료 방어)
-MIN_HOLD_TIME_SECONDS = 28800    # 최소 포지션 유지 시간: 8시간 (펀딩비 최소 1회 수령 후 스위칭 허용)
-CHECK_INTERVAL_SECONDS = 60      # 1분 간격 체크
+ROTATION_THRESHOLD_SCORE = 1.5    # 신규 종목 펀딩비가 기존 대비 50% 이상 높을 때만 스위칭 (수수료 방어)
+MIN_HOLD_TIME_SECONDS = 28800     # 최소 포지션 유지 시간: 8시간 (펀딩비 최소 1회 수령 후 스위칭 허용)
+CHECK_INTERVAL_SECONDS = 60       # 1분 간격 체크
 
 # 고도화 실행 옵션 (Pure Maker Chasing & Slippage)
 MAX_SLIPPAGE_TOLERANCE_PCT = 0.002 # 0.2% 이상 예상 슬리피지 발생 시 진입 취소
-CHASE_RETRY_LIMIT = 5              # 100% 지정가 Chasing 재시도 횟수
-CHASE_TIMEOUT_SECONDS = 2.0        # 회당 체결 대기 시간(초)
+CHASE_RETRY_LIMIT = 5               # 100% 지정가 Chasing 재시도 횟수
+CHASE_TIMEOUT_SECONDS = 2.0         # 회당 체결 대기 시간(초)
 
 # 리스크 관리 파라미터
-MAX_BASIS_DIVERGENCE_PCT = 0.02   # 현선 괴리율(Basis) 2% 이상 확대로 델타 붕괴 시 손절
-TOTAL_EQUITY_STOP_LOSS_PCT = 0.03 # 진입 시점 대비 계정 총 자산 -3% 손실 시 전체 손절
-LIQUIDATION_BUFFER_PCT = 0.05     # 청산가와 현재가 거리 5% 이하 진입 시 안전 청산
-STATE_FILE = "bot_state.json"     # 포지션 상태 저장 파일
+MAX_BASIS_DIVERGENCE_PCT = 0.02    # 현선 괴리율(Basis) 2% 이상 확대로 델타 붕괴 시 손절
+TOTAL_EQUITY_STOP_LOSS_PCT = 0.03  # 진입 시점 대비 계정 총 자산 -3% 손실 시 전체 손절
+LIQUIDATION_BUFFER_PCT = 0.05      # 청산가와 현재가 거리 5% 이하 진입 시 안전 청산
+STATE_FILE = "bot_state.json"      # 포지션 상태 저장 파일
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -638,7 +639,7 @@ class DeltaNeutralBot:
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 # ==========================================
-# 4. 메인 실행부 (Telegram Bot 비동기 루프 통합)
+# 4. 메인 실행부 (Telegram Bot 비동기 루프 및 명령어 통합)
 # ==========================================
 async def main():
     notifier = TelegramNotifier(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
@@ -649,7 +650,7 @@ async def main():
 
     def admin_only(func):
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            if update.effective_user.id != TELEGRAM_ADMIN_ID:
+            if TELEGRAM_ADMIN_ID != 0 and update.effective_user.id != TELEGRAM_ADMIN_ID:
                 await update.message.reply_text("⛔ **권한이 없습니다.**")
                 return
             return await func(update, context)
@@ -660,29 +661,102 @@ async def main():
         bot.is_active = not bot.is_active
         bot.save_state()
         status_str = "ON 🟢" if bot.is_active else "OFF 🔴"
-        await update.message.reply_text(f"스위치 상태: {status_str}")
+        await update.message.reply_text(f"⚙️ **스위치 상태**: {status_str}")
 
     @admin_only
     async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "작동 중 🟢" if bot.is_active else "정지 중 🔴"
-        curr = bot.current_symbol if bot.current_symbol else "없음"
+        curr = bot.current_symbol if bot.current_symbol else "없음 (대기 중)"
         equity = await bot.get_total_equity_usdt()
         held_hours = (time.time() - bot.entry_timestamp) / 3600.0 if bot.entry_timestamp > 0 else 0.0
         
-        await update.message.reply_text(
-            f"상태: {status}\n"
-            f"현재 포지션: {curr}\n"
-            f"유지 시간: {held_hours:.1f}시간\n"
-            f"총 자산: ${equity:.2f} USDT\n"
-            f"현물진입가: {bot.entry_spot_price}\n"
-            f"선물진입가: {bot.entry_swap_price}\n"
-            f"청산가: {bot.liquidation_price}"
-        )
+        funding_rate_str = "N/A"
+        dist_liq_str = "N/A"
+        
+        if bot.current_swap_symbol:
+            try:
+                funding_info = await bot.exchange_rest.fetch_funding_rate(bot.current_swap_symbol)
+                fr = float(funding_info.get('fundingRate', 0) or 0)
+                funding_rate_str = f"{fr * 100:.4f}%"
+                
+                ticker = await bot.exchange_rest.fetch_ticker(bot.current_swap_symbol)
+                curr_price = float(ticker.get('last', 0))
+                if bot.liquidation_price > 0 and curr_price > 0:
+                    dist_pct = ((bot.liquidation_price - curr_price) / curr_price) * 100
+                    dist_liq_str = f"{dist_pct:.2f}% 안전거리"
+            except Exception as e:
+                logger.error(f"Status command fetch error: {e}")
 
-    # Telegram Application 설정
+        msg = (
+            f"📊 **현재 봇 진행 상태**\n\n"
+            f"• 가동 상태: {status}\n"
+            f"• 현재 포지션: {curr}\n"
+            f"• 포지션 유지: {held_hours:.1f} 시간\n"
+            f"• 계정 총 자산: ${equity:.2f} USDT\n\n"
+            f"• 현물 진입가: {bot.entry_spot_price}\n"
+            f"• 선물 진입가: {bot.entry_swap_price}\n"
+            f"• 선물 청산가: {bot.liquidation_price} ({dist_liq_str})\n"
+            f"• 현재 펀딩비: {funding_rate_str}"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    @admin_only
+    async def cmd_profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        current_equity = await bot.get_total_equity_usdt()
+        init_equity = bot.initial_equity_usdt
+        
+        balance = await bot.exchange_rest.fetch_balance()
+        usdt_free = float(balance.get('USDT', {}).get('free', 0.0))
+
+        if init_equity > 0:
+            pnl_usdt = current_equity - init_equity
+            pnl_rate = (pnl_usdt / init_equity) * 100
+            pnl_msg = f"• 진입 대비 손익: {pnl_usdt:+.2f} USDT ({pnl_rate:+.2f}%)"
+        else:
+            pnl_msg = "• 진입 대비 손익: 기준 자산 정보 없음 (포지션 미보유 중)"
+
+        msg = (
+            f"💰 **수익 및 수익률 현황**\n\n"
+            f"• 총 평가 자산: ${current_equity:.2f} USDT\n"
+            f"• 가용 가능 USDT: ${usdt_free:.2f} USDT\n"
+            f"• 포지션 초기 자산: ${init_equity:.2f} USDT\n"
+            f"{pnl_msg}"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    @admin_only
+    async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("🛑 **봇을 안전하게 종료합니다.** 프로세스를 정리합니다...")
+        bot.is_active = False
+        bot.save_state()
+        
+        # 비동기 루프 안전 종료
+        asyncio.create_task(shutdown_bot())
+
+    @admin_only
+    async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("🔄 **봇 프로세스를 재시작합니다.** 잠시만 기다려 주세요...")
+        bot.save_state()
+        
+        # 프로세스 자체 재구동
+        os.execv(sys.executable, ['python3'] + sys.argv)
+
+    async def shutdown_bot():
+        await updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await bot.exchange_rest.close()
+        await bot.exchange_ws.close()
+        await notifier.close_session()
+        os._exit(0)
+
+    # Telegram Application 설정 및 핸들러 추가
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("switch", cmd_switch))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("profit", cmd_profit))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("restart", cmd_restart))
 
     await app.initialize()
     await app.start()
@@ -710,4 +784,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Program terminated cleanly.")
+        pass
