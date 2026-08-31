@@ -22,6 +22,9 @@ PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID")
 
+# 🎯 펀딩비 진입 기준 설정 (0.030% = 0.0003)
+MIN_FUNDING_RATE = 0.0003 
+
 # 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
@@ -32,7 +35,7 @@ logging.basicConfig(
     ]
 )
 
-# OKX CCXT 객체 생성 (이중 접속 처리)
+# OKX CCXT 객체 생성
 def get_okx_client():
     return ccxt.okx({
         'apiKey': API_KEY,
@@ -60,16 +63,6 @@ async def send_telegram_msg_async(app: Application, text: str):
             await app.bot.send_message(chat_id=TELEGRAM_ADMIN_ID, text=text)
         except Exception as e:
             logging.error(f"텔레그램 메시지 전송 실패: {e}")
-
-def send_telegram_msg_sync(text: str):
-    """동기 환경(필요시) 메세지 전송용"""
-    if TELEGRAM_TOKEN and TELEGRAM_ADMIN_ID:
-        try:
-            import requests
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            requests.post(url, data={"chat_id": TELEGRAM_ADMIN_ID, "text": text}, timeout=5)
-        except Exception as e:
-            logging.error(f"동기 텔레그램 전송 실패: {e}")
 
 # ==========================================
 # 3. 데이터 및 포지션 조회 함수
@@ -133,6 +126,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = f"📊 [봇 현재 상태 보고]\n\n"
     msg += f"• 스위치 상태: {switch_str}\n"
+    msg += f"• 진입 기준 펀딩비: {MIN_FUNDING_RATE * 100:.3f}%\n"
     msg += f"• 총 자산: ${usdt_total:.2f} USDT\n"
     msg += f"• 현물(XRP) 가격: ${spot_price:.4f}\n"
     msg += f"• 선물(XRP) 가격: ${swap_price:.4f}\n"
@@ -217,10 +211,17 @@ def trade_logic_cycle():
     funding_rate = get_funding_rate()
     pos = get_positions()
 
-    # 예시 매매 로직 로그 (정상 작동 모니터링용)
-    logging.info(f"[감시 중] 현물: ${spot_price:.4f} | 선물: ${swap_price:.4f} | 펀딩비: {funding_rate*100:.4f}% | 포지션: {'보유' if pos else '미보유'}")
+    # 모니터링 로그 출력
+    logging.info(
+        f"[감시 중] 현물: ${spot_price:.4f} | 선물: ${swap_price:.4f} | "
+        f"현재 펀딩비: {funding_rate*100:.4f}% (목표: {MIN_FUNDING_RATE*100:.3f}%) | "
+        f"포지션: {'보유' if pos else '미보유'}"
+    )
 
-    # (필요시 상세 진입/청산 로직 확장 위치)
+    # 🎯 펀딩비 조건 판단 예시
+    if not pos and funding_rate >= MIN_FUNDING_RATE:
+        logging.info(f"🚀 진입 조건 충족! (현재 펀딩비: {funding_rate*100:.4f}% >= 목표: {MIN_FUNDING_RATE*100:.3f}%)")
+        # 실제 매수/숏 주문 로직 실행 위치
 
 # ==========================================
 # 6. 비동기 백그라운드 태스크 (30분 주기 로그 알림)
@@ -239,7 +240,7 @@ async def periodic_log_reporter(app: Application):
             log_msg = f"⏰ [30분 정기 상태 알림]\n\n"
             log_msg += f"• 자산: ${usdt_total:.2f} USDT\n"
             log_msg += f"• 현물/선물: ${spot_price:.4f} / ${swap_price:.4f}\n"
-            log_msg += f"• 펀딩비: {funding_rate:.4f}%\n"
+            log_msg += f"• 현재 펀딩비: {funding_rate:.4f}% (목표: {MIN_FUNDING_RATE*100:.3f}%)\n"
             log_msg += f"• 포지션: {'보유 중 (숏)' if pos else '미보유 (관망 중)'}\n"
             log_msg += f"• 스위치: {'🟢 ON' if BOT_SWITCH else '🔴 OFF'}"
 
@@ -249,10 +250,9 @@ async def periodic_log_reporter(app: Application):
             logging.error(f"30분 정기 로그 전송 에러: {e}")
 
 # ==========================================
-# 7. 비동기 메인 이벤트 루프 (Event Loop)
+# 7. 비동기 메인 이벤트 루프
 # ==========================================
 async def main():
-    # 텔레그램 애플리케이션 생성
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # 명령어 핸들러 등록
@@ -262,13 +262,13 @@ async def main():
     application.add_handler(CommandHandler("restart", restart_command))
     application.add_handler(CommandHandler("stop", stop_command))
 
-    # 1. 텔레그램 봇 폴링 비동기 시작
+    # 1. 텔레그램 봇 비동기 시작
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
 
-    logging.info("🤖 수수료 극소화형 델타 뉴트럴 자동 매매 봇 가동 시작")
-    await send_telegram_msg_async(application, "🤖 수수료 극소화형 델타 뉴트럴 자동 매매 봇이 정상 시작되었습니다.")
+    logging.info(f"🤖 델타 뉴트럴 자동 매매 봇 시작 (목표 펀딩비: {MIN_FUNDING_RATE*100:.3f}%)")
+    await send_telegram_msg_async(application, f"🤖 델타 뉴트럴 자동 매매 봇 시작되었습니다.\n(최소 진입 펀딩비 기준: {MIN_FUNDING_RATE*100:.3f}%)")
 
     # 2. 30분 정기 로그 보고 백그라운드 태스크 시작
     asyncio.create_task(periodic_log_reporter(application))
@@ -277,12 +277,11 @@ async def main():
     try:
         while True:
             try:
-                # 10초마다 매매 감시 로직 실행
                 trade_logic_cycle()
             except Exception as e:
                 logging.error(f"매매 루프 오류: {e}")
 
-            await asyncio.sleep(10)  # Non-blocking 비동기 대기
+            await asyncio.sleep(10)
             
     except (KeyboardInterrupt, SystemExit):
         logging.info("봇 종료 요청을 받았습니다.")
