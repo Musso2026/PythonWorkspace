@@ -12,9 +12,18 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==========================================
-# 1. 환경 변수 및 기본 설정
+# 1. 환경 변수 및 기본 설정 (.env 경로 자동 감지)
 # ==========================================
-load_dotenv()
+# 1) PythonWorkspace 폴더 내 .env 우선 확인, 없으면 홈 디렉토리 ~/.env 확인
+workspace_env = os.path.expanduser('~/PythonWorkspace/.env')
+home_env = os.path.expanduser('~/.env')
+
+if os.path.exists(workspace_env):
+    load_dotenv(dotenv_path=workspace_env)
+elif os.path.exists(home_env):
+    load_dotenv(dotenv_path=home_env)
+else:
+    load_dotenv()  # 기본 로드
 
 API_KEY = os.getenv("OKX_API_KEY")
 SECRET_KEY = os.getenv("OKX_SECRET_KEY")
@@ -114,7 +123,7 @@ def get_ticker_prices():
 # ==========================================
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/status 명령어"""
-    if str(update.effective_user.id) != TELEGRAM_ADMIN_ID:
+    if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
 
     spot_price, swap_price = get_ticker_prices()
@@ -152,7 +161,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def profit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/profit 명령어"""
-    if str(update.effective_user.id) != TELEGRAM_ADMIN_ID:
+    if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
 
     usdt_free, usdt_total = get_balance()
@@ -175,7 +184,7 @@ async def profit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/switch 명령어"""
-    if str(update.effective_user.id) != TELEGRAM_ADMIN_ID:
+    if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
 
     global BOT_SWITCH
@@ -185,7 +194,7 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/restart 명령어"""
-    if str(update.effective_user.id) != TELEGRAM_ADMIN_ID:
+    if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
 
     await update.message.reply_text("🔄 봇 프로세스를 재시작합니다...")
@@ -193,7 +202,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/stop 명령어"""
-    if str(update.effective_user.id) != TELEGRAM_ADMIN_ID:
+    if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
 
     await update.message.reply_text("🛑 봇을 완전히 종료합니다.")
@@ -218,7 +227,7 @@ def trade_logic_cycle():
         f"포지션: {'보유' if pos else '미보유'}"
     )
 
-    # 🎯 펀딩비 조건 판단 예시
+    # 🎯 펀딩비 조건 판단
     if not pos and funding_rate >= MIN_FUNDING_RATE:
         logging.info(f"🚀 진입 조건 충족! (현재 펀딩비: {funding_rate*100:.4f}% >= 목표: {MIN_FUNDING_RATE*100:.3f}%)")
         # 실제 매수/숏 주문 로직 실행 위치
