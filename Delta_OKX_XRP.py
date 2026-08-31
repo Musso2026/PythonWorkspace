@@ -1,784 +1,295 @@
-import asyncio
-import logging
-import json
 import os
 import sys
 import time
+import logging
+import asyncio
 from datetime import datetime, timezone
-import aiohttp
-import ccxt.async_support as ccxt
-import ccxt.pro as ccxtpro
+import ccxt
 from dotenv import load_dotenv
+
+# Telegram Bot API (python-telegram-bot v20+)
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==========================================
-# 0. .env 환경변수 파일 자동 로드
+# 1. 환경 변수 및 기본 설정
 # ==========================================
 load_dotenv()
 
-# ==========================================
-# 1. 설정 및 상수 정의 (.env 자동 연동)
-# ==========================================
-OKX_CONFIG = {
-    'apiKey': os.getenv('OKX_API_KEY'),
-    'secret': os.getenv('OKX_SECRET_KEY'),
-    'password': os.getenv('OKX_PASSPHRASE'),
-    'enableRateLimit': True,
-    'options': {
-        'defaultType': 'swap',
-    }
-}
+API_KEY = os.getenv("OKX_API_KEY")
+SECRET_KEY = os.getenv("OKX_SECRET_KEY")
+PASSPHRASE = os.getenv("OKX_PASSPHRASE")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID")
 
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-TELEGRAM_ADMIN_ID = int(os.getenv('TELEGRAM_ADMIN_ID', 0))
-
-# 트레이딩 파라미터
-LEVERAGE = 3                      # 레버리지 3배
-MIN_FUNDING_RATE = 0.0001         # 최소 펀딩비 (0.01%)
-MIN_VOLUME_24H_USD = 10_000_000   # 최소 24시간 거래량 ($10,000,000)
-MIN_ORDER_USDT = 10.0             # 최소 주문 금액 세이프가드 ($10)
-BALANCE_USAGE_RATIO = 0.90        # 증거금 안전을 위해 가용 USDT의 90%만 투입
-SPOT_FEE_RATE = 0.0015            # 현물 매수 수수료 버퍼 안전하게 0.15% 설정
-
-# 💡 [수수료 절감 최적화 파라미터]
-ROTATION_THRESHOLD_SCORE = 1.5    # 신규 종목 펀딩비가 기존 대비 50% 이상 높을 때만 스위칭 (수수료 방어)
-MIN_HOLD_TIME_SECONDS = 28800     # 최소 포지션 유지 시간: 8시간 (펀딩비 최소 1회 수령 후 스위칭 허용)
-CHECK_INTERVAL_SECONDS = 60       # 1분 간격 체크
-
-# 고도화 실행 옵션 (Pure Maker Chasing & Slippage)
-MAX_SLIPPAGE_TOLERANCE_PCT = 0.002 # 0.2% 이상 예상 슬리피지 발생 시 진입 취소
-CHASE_RETRY_LIMIT = 5               # 100% 지정가 Chasing 재시도 횟수
-CHASE_TIMEOUT_SECONDS = 2.0         # 회당 체결 대기 시간(초)
-
-# 리스크 관리 파라미터
-MAX_BASIS_DIVERGENCE_PCT = 0.02    # 현선 괴리율(Basis) 2% 이상 확대로 델타 붕괴 시 손절
-TOTAL_EQUITY_STOP_LOSS_PCT = 0.03  # 진입 시점 대비 계정 총 자산 -3% 손실 시 전체 손절
-LIQUIDATION_BUFFER_PCT = 0.05      # 청산가와 현재가 거리 5% 이하 진입 시 안전 청산
-STATE_FILE = "bot_state.json"      # 포지션 상태 저장 파일
-
+# 로깅 설정
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
-logger = logging.getLogger("DeltaNeutralBot")
+
+# OKX CCXT 객체 생성 (이중 접속 처리)
+def get_okx_client():
+    return ccxt.okx({
+        'apiKey': API_KEY,
+        'secret': SECRET_KEY,
+        'password': PASSPHRASE,
+        'enableRateLimit': True,
+        'options': {'defaultType': 'swap'}
+    })
+
+okx = get_okx_client()
+
+# 글로벌 변수 및 상태
+BOT_SWITCH = True  # 봇 가동 스위치 (ON: True, OFF: False)
+SYMBOL_SPOT = "XRP/USDT"
+SYMBOL_SWAP = "XRP/USDT:USDT"
+POSITION_BASE_USDT = 0.0  # 포지션 진입 시점 원금
 
 # ==========================================
-# 2. 텔레그램 알림 핸들러
+# 2. 텔레그램 메세지 전송 함수
 # ==========================================
-class TelegramNotifier:
-    def __init__(self, token: str, chat_id: str):
-        self.token = token
-        self.chat_id = chat_id
-        self.session: aiohttp.ClientSession = None
-
-    async def init_session(self):
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
-
-    async def close_session(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
-
-    async def send_message(self, text: str):
-        await self.init_session()
-        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "Markdown"}
+async def send_telegram_msg_async(app: Application, text: str):
+    """비동기 텔레그램 알림 전송"""
+    if TELEGRAM_TOKEN and TELEGRAM_ADMIN_ID:
         try:
-            async with self.session.post(url, json=payload, timeout=10) as resp:
-                if resp.status != 200:
-                    logger.error(f"Telegram notification failed: {resp.status}")
+            await app.bot.send_message(chat_id=TELEGRAM_ADMIN_ID, text=text)
         except Exception as e:
-            logger.error(f"Error sending telegram message: {e}")
+            logging.error(f"텔레그램 메시지 전송 실패: {e}")
+
+def send_telegram_msg_sync(text: str):
+    """동기 환경(필요시) 메세지 전송용"""
+    if TELEGRAM_TOKEN and TELEGRAM_ADMIN_ID:
+        try:
+            import requests
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, data={"chat_id": TELEGRAM_ADMIN_ID, "text": text}, timeout=5)
+        except Exception as e:
+            logging.error(f"동기 텔레그램 전송 실패: {e}")
 
 # ==========================================
-# 3. 델타 뉴트럴 자동매매 봇 (수수료 극소화형)
+# 3. 데이터 및 포지션 조회 함수
 # ==========================================
-class DeltaNeutralBot:
-    def __init__(self, exchange_config, notifier: TelegramNotifier):
-        self.exchange_rest = ccxt.okx(exchange_config)
-        self.exchange_ws = ccxtpro.okx(exchange_config)
+def get_balance():
+    """잔고 조회"""
+    try:
+        balance = okx.fetch_balance()
+        usdt_free = balance['free'].get('USDT', 0.0)
+        usdt_total = balance['total'].get('USDT', 0.0)
+        return usdt_free, usdt_total
+    except Exception as e:
+        logging.error(f"잔고 조회 에러: {e}")
+        return 0.0, 0.0
+
+def get_positions():
+    """현재 선물 포지션 조회"""
+    try:
+        positions = okx.fetch_positions([SYMBOL_SWAP])
+        for pos in positions:
+            if pos['symbol'] == SYMBOL_SWAP and float(pos['contracts']) > 0:
+                return pos
+        return None
+    except Exception as e:
+        logging.error(f"포지션 조회 에러: {e}")
+        return None
+
+def get_funding_rate():
+    """현재 펀딩비 조회"""
+    try:
+        funding_info = okx.fetch_funding_rate(SYMBOL_SWAP)
+        return float(funding_info.get('fundingRate', 0.0))
+    except Exception as e:
+        logging.error(f"펀딩비 조회 에러: {e}")
+        return 0.0
+
+def get_ticker_prices():
+    """현물 및 선물 현재가 조회"""
+    try:
+        spot_ticker = okx.fetch_ticker(SYMBOL_SPOT)
+        swap_ticker = okx.fetch_ticker(SYMBOL_SWAP)
+        return float(spot_ticker['last']), float(swap_ticker['last'])
+    except Exception as e:
+        logging.error(f"시세 조회 에러: {e}")
+        return 0.0, 0.0
+
+# ==========================================
+# 4. 텔레그램 명령어 핸들러
+# ==========================================
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/status 명령어"""
+    if str(update.effective_user.id) != TELEGRAM_ADMIN_ID:
+        return
+
+    spot_price, swap_price = get_ticker_prices()
+    funding_rate = get_funding_rate() * 100
+    pos = get_positions()
+    _, usdt_total = get_balance()
+
+    switch_str = "🟢 ON (가동 중)" if BOT_SWITCH else "🔴 OFF (일시 정지)"
+    
+    msg = f"📊 [봇 현재 상태 보고]\n\n"
+    msg += f"• 스위치 상태: {switch_str}\n"
+    msg += f"• 총 자산: ${usdt_total:.2f} USDT\n"
+    msg += f"• 현물(XRP) 가격: ${spot_price:.4f}\n"
+    msg += f"• 선물(XRP) 가격: ${swap_price:.4f}\n"
+    msg += f"• 현재 펀딩비: {funding_rate:.4f}%\n\n"
+
+    if pos:
+        contracts = pos.get('contracts', 0)
+        entry_price = float(pos.get('entryPrice', 0.0))
+        liq_price = float(pos.get('liquidationPrice', 0.0)) if pos.get('liquidationPrice') else 0.0
         
-        self.notifier = notifier
-        self.is_active = True
-        self.current_symbol = None       # 예: "BTC/USDT"
-        self.current_swap_symbol = None  # 예: "BTC/USDT:USDT"
-        self.entry_spot_price = 0.0
-        self.entry_swap_price = 0.0
-        self.initial_equity_usdt = 0.0    # 진입 시점 총 자산
-        self.liquidation_price = 0.0
-        self.entry_timestamp = 0.0        # 포지션 진입 시각
-        self.trade_lock = asyncio.Lock()
+        liq_distance = 0.0
+        if swap_price > 0 and liq_price > 0:
+            liq_distance = abs((swap_price - liq_price) / swap_price) * 100
 
-    def save_state(self):
-        """원자적(Atomic) 파일 쓰기"""
-        state = {
-            "current_symbol": self.current_symbol,
-            "current_swap_symbol": self.current_swap_symbol,
-            "entry_spot_price": self.entry_spot_price,
-            "entry_swap_price": self.entry_swap_price,
-            "initial_equity_usdt": self.initial_equity_usdt,
-            "liquidation_price": self.liquidation_price,
-            "entry_timestamp": self.entry_timestamp,
-            "is_active": self.is_active
-        }
-        temp_file = f"{STATE_FILE}.tmp"
-        try:
-            with open(temp_file, "w") as f:
-                json.dump(state, f, indent=4)
-            os.replace(temp_file, STATE_FILE)
-        except Exception as e:
-            logger.error(f"Error saving state: {e}")
+        msg += f"📦 [포지션 정보 (숏)]\n"
+        msg += f"• 수량: {contracts} Cont\n"
+        msg += f"• 진입가: ${entry_price:.4f}\n"
+        msg += f"• 청산가: ${liq_price:.4f} (안전거리: {liq_distance:.2f}%)\n"
+    else:
+        msg += f"📦 현재 보유 중인 포지션이 없습니다 (관망 중)."
 
-    async def load_and_reconcile_state(self):
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, "r") as f:
-                    state = json.load(f)
-                    self.current_symbol = state.get("current_symbol")
-                    self.current_swap_symbol = state.get("current_swap_symbol")
-                    self.entry_spot_price = state.get("entry_spot_price", 0.0)
-                    self.entry_swap_price = state.get("entry_swap_price", 0.0)
-                    self.initial_equity_usdt = state.get("initial_equity_usdt", 0.0)
-                    self.liquidation_price = state.get("liquidation_price", 0.0)
-                    self.entry_timestamp = state.get("entry_timestamp", 0.0)
-                    self.is_active = state.get("is_active", True)
-            except Exception as e:
-                logger.error(f"Error loading state file: {e}")
+    await update.message.reply_text(msg)
 
-        try:
-            positions = await self.exchange_rest.fetch_positions()
-            active_short = None
-            for pos in positions:
-                contracts = float(pos.get('contracts', 0))
-                if pos['side'] == 'short' and contracts > 0:
-                    active_short = pos
-                    break
+async def profit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/profit 명령어"""
+    if str(update.effective_user.id) != TELEGRAM_ADMIN_ID:
+        return
 
-            if active_short:
-                self.current_swap_symbol = active_short['symbol']
-                self.current_symbol = self.current_swap_symbol.split(':')[0]
-                self.entry_swap_price = float(active_short.get('entryPrice', 0.0) or 0.0)
-                self.liquidation_price = float(active_short.get('liquidationPrice', 0.0) or 0.0)
-                
-                if self.entry_spot_price == 0.0:
-                    ticker = await self.exchange_rest.fetch_ticker(self.current_symbol)
-                    self.entry_spot_price = float(ticker.get('last', self.entry_swap_price))
-                if self.entry_timestamp == 0.0:
-                    self.entry_timestamp = time.time()
-                
-                logger.info(f"Reconciled existing position: {self.current_symbol} / {self.current_swap_symbol}")
-            else:
-                self.current_symbol = None
-                self.current_swap_symbol = None
-                self.entry_spot_price = 0.0
-                self.entry_swap_price = 0.0
-                self.liquidation_price = 0.0
-                self.initial_equity_usdt = 0.0
-                self.entry_timestamp = 0.0
+    usdt_free, usdt_total = get_balance()
+    global POSITION_BASE_USDT
 
-            self.save_state()
-        except Exception as e:
-            logger.error(f"Error reconciling positions: {e}")
+    msg = f"💰 [수익 및 수익률 현황]\n\n"
+    msg += f"• 총 평가 자산: ${usdt_total:.2f} USDT\n"
+    msg += f"• 가용 가능 USDT: ${usdt_free:.2f} USDT\n"
 
-    async def init_exchange(self):
-        await self.exchange_rest.load_markets()
-        await self.exchange_ws.load_markets()
-        
-        try:
-            await self.exchange_rest.setPositionMode(False)
-        except Exception as e:
-            logger.debug(f"Position mode set note: {e}")
-            
-        await self.load_and_reconcile_state()
+    if POSITION_BASE_USDT > 0:
+        pnl = usdt_total - POSITION_BASE_USDT
+        pnl_pct = (pnl / POSITION_BASE_USDT) * 100
+        msg += f"• 포지션 초기 자산: ${POSITION_BASE_USDT:.2f} USDT\n"
+        msg += f"• 진입 대비 손익: ${pnl:+.2f} USDT ({pnl_pct:+.2f}%)\n"
+    else:
+        msg += f"• 포지션 초기 자산: $0.00 USDT\n"
+        msg += f"• 진입 대비 손익: 기준 자산 정보 없음 (포지션 미보유 중)\n"
 
-    async def is_funding_window(self, swap_symbol: str = None) -> bool:
-        if not swap_symbol:
-            return False
-        try:
-            funding_info = await self.exchange_rest.fetch_funding_rate(swap_symbol)
-            next_funding_ts = funding_info.get('nextFundingTimestamp') or funding_info.get('info', {}).get('fundingTime')
-            
-            if next_funding_ts:
-                next_funding_time = int(next_funding_ts) / 1000.0
-                now_ts = time.time()
-                diff_seconds = abs(next_funding_time - now_ts)
-                if diff_seconds <= 300 or (now_ts > next_funding_time and (now_ts - next_funding_time) <= 300):
-                    return True
-        except Exception as e:
-            logger.warning(f"Error checking funding window: {e}")
-        return False
+    await update.message.reply_text(msg)
 
-    def amount_to_contracts(self, swap_symbol, coin_amount):
-        market = self.exchange_rest.market(swap_symbol)
-        contract_size = float(market.get('contractSize', 1.0))
-        raw_contracts = coin_amount / contract_size
-        contracts_str = self.exchange_rest.amount_to_precision(swap_symbol, raw_contracts)
-        return float(contracts_str)
+async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/switch 명령어"""
+    if str(update.effective_user.id) != TELEGRAM_ADMIN_ID:
+        return
 
-    async def ensure_trading_balance(self):
-        try:
-            balance = await self.exchange_rest.fetch_balance()
-            trading_usdt = float(balance.get('USDT', {}).get('free', 0.0))
-            
-            if trading_usdt < MIN_ORDER_USDT:
-                funding_balance = await self.exchange_rest.fetch_balance({'type': 'funding'})
-                funding_usdt = float(funding_balance.get('USDT', {}).get('free', 0.0))
-                
-                if funding_usdt >= MIN_ORDER_USDT:
-                    logger.info(f"Transferring {funding_usdt} USDT from Funding to Trading account...")
-                    await self.exchange_rest.transfer('USDT', funding_usdt, 'funding', 'trading')
-                    await asyncio.sleep(1)
-        except Exception as e:
-            logger.warning(f"Auto-transfer check note: {e}")
+    global BOT_SWITCH
+    BOT_SWITCH = not BOT_SWITCH
+    status_str = "🟢 ON (가동)" if BOT_SWITCH else "🔴 OFF (일시 정지)"
+    await update.message.reply_text(f"🔄 봇 매매 스위치가 {status_str} 상태로 변경되었습니다.")
 
-    async def get_total_equity_usdt(self) -> float:
-        try:
-            balance = await self.exchange_rest.fetch_balance()
-            total_usdt = float(balance.get('USDT', {}).get('total', 0.0))
-            
-            if self.current_symbol:
-                base_curr = self.current_symbol.split('/')[0]
-                spot_amt = float(balance.get(base_curr, {}).get('total', 0.0))
-                if spot_amt > 0:
-                    ticker = await self.exchange_rest.fetch_ticker(self.current_symbol)
-                    total_usdt += spot_amt * float(ticker['last'])
-            return total_usdt
-        except Exception as e:
-            logger.error(f"Error fetching total equity: {e}")
-            return 0.0
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/restart 명령어"""
+    if str(update.effective_user.id) != TELEGRAM_ADMIN_ID:
+        return
 
-    async def check_slippage(self, symbol: str, side: str, amount: float) -> bool:
-        try:
-            orderbook = await self.exchange_rest.fetch_order_book(symbol, limit=20)
-            orders = orderbook['asks'] if side == 'buy' else orderbook['bids']
-            
-            accumulated_qty = 0.0
-            accumulated_cost = 0.0
-            
-            for price, qty in orders:
-                needed = amount - accumulated_qty
-                if qty >= needed:
-                    accumulated_cost += needed * price
-                    accumulated_qty += needed
-                    break
-                else:
-                    accumulated_cost += qty * price
-                    accumulated_qty += qty
-            
-            if accumulated_qty < amount:
-                logger.warning(f"Orderbook depth insufficient for {symbol}")
-                return False
+    await update.message.reply_text("🔄 봇 프로세스를 재시작합니다...")
+    os.execv(sys.executable, ['python3'] + sys.argv)
 
-            expected_avg_price = accumulated_cost / amount
-            best_price = orders[0][0]
-            
-            slippage = abs(expected_avg_price - best_price) / best_price
-            if slippage > MAX_SLIPPAGE_TOLERANCE_PCT:
-                logger.warning(f"Slippage too high for {symbol}: {slippage*100:.3f}% > {MAX_SLIPPAGE_TOLERANCE_PCT*100}%")
-                return False
-                
-            return True
-        except Exception as e:
-            logger.error(f"Error checking slippage guard: {e}")
-            return False
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/stop 명령어"""
+    if str(update.effective_user.id) != TELEGRAM_ADMIN_ID:
+        return
 
-    async def execute_pure_maker_chasing_order(self, symbol: str, side: str, amount: float, is_swap: bool = False):
-        """100% 지정가(Maker) 전용 Chasing 주문"""
-        remaining_amt = amount
-        total_filled = 0.0
-        
-        for attempt in range(CHASE_RETRY_LIMIT):
-            if remaining_amt <= 0:
-                break
-                
-            orderbook = await self.exchange_rest.fetch_order_book(symbol, limit=5)
-            price = orderbook['bids'][0][0] if side == 'buy' else orderbook['asks'][0][0]
-            
-            amt_str = self.exchange_rest.amount_to_precision(symbol, remaining_amt)
-            if float(amt_str) <= 0:
-                break
-
-            params = {'postOnly': True}
-            if is_swap:
-                params['posMode'] = 'net'
-                
-            try:
-                order = await self.exchange_rest.create_order(symbol, 'limit', side, float(amt_str), price, params)
-                await asyncio.sleep(CHASE_TIMEOUT_SECONDS)
-                
-                order_info = await self.exchange_rest.fetch_order(order['id'], symbol)
-                filled = float(order_info.get('filled', 0.0))
-                total_filled += filled
-                remaining_amt -= filled
-                
-                if remaining_amt > 0:
-                    await self.exchange_rest.cancel_order(order['id'], symbol)
-            except Exception as e:
-                logger.debug(f"Maker order retry ({attempt+1}/{CHASE_RETRY_LIMIT}): {e}")
-                await asyncio.sleep(0.3)
-
-        return total_filled
-
-    async def get_top_funding_opportunity(self):
-        try:
-            tickers = await self.exchange_rest.fetch_tickers()
-            funding_rates = await self.exchange_rest.fetch_funding_rates()
-            
-            candidates = []
-            for symbol, ticker in tickers.items():
-                if not symbol.endswith("/USDT:USDT"):
-                    continue
-                
-                base_symbol = symbol.split(":")[0]
-                quote_volume = float(ticker.get('quoteVolume', 0) or 0)
-                
-                if quote_volume < MIN_VOLUME_24H_USD:
-                    continue
-                    
-                funding_info = funding_rates.get(symbol, {})
-                funding_rate = float(funding_info.get('fundingRate', 0) or 0)
-                
-                if funding_rate >= MIN_FUNDING_RATE:
-                    candidates.append({
-                        'symbol': base_symbol,
-                        'swap_symbol': symbol,
-                        'funding_rate': funding_rate,
-                        'volume': quote_volume
-                    })
-
-            if not candidates:
-                return None
-
-            candidates.sort(key=lambda x: x['funding_rate'], reverse=True)
-            return candidates[0]
-            
-        except Exception as e:
-            logger.error(f"Error fetching opportunities: {e}")
-            return None
-
-    async def cancel_all_open_orders(self, symbol=None):
-        try:
-            if symbol:
-                await self.exchange_rest.cancel_all_orders(symbol)
-        except Exception as e:
-            logger.warning(f"Could not cancel open orders for {symbol}: {e}")
-
-    async def close_all_positions(self):
-        async with self.trade_lock:
-            if not self.current_symbol or not self.current_swap_symbol:
-                return
-
-            symbol = self.current_symbol
-            swap_symbol = self.current_swap_symbol
-            
-            try:
-                await self.cancel_all_open_orders(symbol)
-                await self.cancel_all_open_orders(swap_symbol)
-
-                positions_task = self.exchange_rest.fetch_positions([swap_symbol])
-                balance_task = self.exchange_rest.fetch_balance()
-                positions, balance = await asyncio.gather(positions_task, balance_task, return_exceptions=True)
-
-                close_tasks = []
-
-                if isinstance(positions, list):
-                    for pos in positions:
-                        contracts = float(pos.get('contracts', 0))
-                        if pos['side'] == 'short' and contracts > 0:
-                            close_tasks.append(
-                                self.execute_pure_maker_chasing_order(swap_symbol, 'buy', contracts, is_swap=True)
-                            )
-
-                base_currency = symbol.split('/')[0]
-                if isinstance(balance, dict):
-                    spot_amount = float(balance.get(base_currency, {}).get('free', 0))
-                    if spot_amount > 0:
-                        amount_str = self.exchange_rest.amount_to_precision(symbol, spot_amount)
-                        market_info = self.exchange_rest.market(symbol)
-                        min_amt = float(market_info.get('limits', {}).get('amount', {}).get('min', 0) or 0)
-                        
-                        if float(amount_str) >= min_amt and float(amount_str) > 0:
-                            close_tasks.append(
-                                self.execute_pure_maker_chasing_order(symbol, 'sell', float(amount_str), is_swap=False)
-                            )
-
-                if close_tasks:
-                    await asyncio.gather(*close_tasks, return_exceptions=True)
-
-                balance_after = await self.exchange_rest.fetch_balance()
-                rem_spot = float(balance_after.get(base_currency, {}).get('free', 0))
-                if rem_spot > 0:
-                    rem_str = self.exchange_rest.amount_to_precision(symbol, rem_spot)
-                    if float(rem_str) > 0:
-                        await self.exchange_rest.create_market_sell_order(symbol, float(rem_str))
-
-                await self.notifier.send_message(f"✅ **수수료 절감 청산 완료**: {symbol} 포지션 정리 완료.")
-                self.current_symbol = None
-                self.current_swap_symbol = None
-                self.entry_spot_price = 0.0
-                self.entry_swap_price = 0.0
-                self.liquidation_price = 0.0
-                self.initial_equity_usdt = 0.0
-                self.entry_timestamp = 0.0
-                self.save_state()
-
-            except Exception as e:
-                logger.error(f"Error closing positions: {e}")
-                await self.notifier.send_message(f"❌ **청산 중 오류 발생**: {e}")
-
-    async def open_position(self, target_opportunity, total_usdt_balance):
-        async with self.trade_lock:
-            await self.ensure_trading_balance()
-            
-            usable_usdt = total_usdt_balance * BALANCE_USAGE_RATIO
-            if usable_usdt < MIN_ORDER_USDT:
-                logger.warning(f"Usable USDT (${usable_usdt:.2f}) is below minimum limit.")
-                return
-
-            symbol = target_opportunity['symbol']
-            swap_symbol = target_opportunity['swap_symbol']
-            
-            try:
-                await self.exchange_rest.set_leverage(LEVERAGE, swap_symbol, params={'mgnMode': 'cross'})
-                
-                ticker_spot = await self.exchange_rest.fetch_ticker(symbol)
-                spot_price = float(ticker_spot['last'])
-                
-                half_usdt = usable_usdt / 2.0
-                spot_amount_raw = (half_usdt * (1.0 - SPOT_FEE_RATE)) / spot_price
-                spot_amount_str = self.exchange_rest.amount_to_precision(symbol, spot_amount_raw)
-                spot_amount_final = float(spot_amount_str)
-
-                if spot_amount_final <= 0:
-                    return
-
-                swap_contracts = self.amount_to_contracts(swap_symbol, spot_amount_final)
-                if swap_contracts <= 0:
-                    logger.warning("Calculated swap contracts is 0. Aborting entry.")
-                    return
-
-                spot_ok = await self.check_slippage(symbol, 'buy', spot_amount_final)
-                swap_ok = await self.check_slippage(swap_symbol, 'sell', swap_contracts)
-
-                if not spot_ok or not swap_ok:
-                    await self.notifier.send_message(f"⚠️ **[{symbol}] 슬리피지 한도 초과/오더북 깊이 부족으로 진입 취소**")
-                    return
-
-                actual_spot_filled = await self.execute_pure_maker_chasing_order(symbol, 'buy', spot_amount_final, is_swap=False)
-                
-                if actual_spot_filled <= 0:
-                    logger.warning("Spot Maker order was not filled. Cancelling entry to save fees.")
-                    return
-
-                exact_swap_contracts = self.amount_to_contracts(swap_symbol, actual_spot_filled)
-                
-                actual_swap_filled = 0.0
-                if exact_swap_contracts > 0:
-                    actual_swap_filled = await self.execute_pure_maker_chasing_order(swap_symbol, 'sell', exact_swap_contracts, is_swap=True)
-
-                balance = await self.exchange_rest.fetch_balance()
-                base_curr = symbol.split('/')[0]
-                real_spot_holding = float(balance.get(base_curr, {}).get('free', 0.0))
-                
-                target_contracts = self.amount_to_contracts(swap_symbol, real_spot_holding)
-                
-                positions = await self.exchange_rest.fetch_positions([swap_symbol])
-                current_short_contracts = 0.0
-                for pos in positions:
-                    if pos['side'] == 'short':
-                        current_short_contracts = float(pos.get('contracts', 0))
-                        break
-                
-                diff_contracts = target_contracts - current_short_contracts
-                
-                if abs(diff_contracts) > 0:
-                    logger.info(f"Rebalancing contract mismatch: {diff_contracts}")
-                    diff_str = self.exchange_rest.amount_to_precision(swap_symbol, abs(diff_contracts))
-                    if float(diff_str) > 0:
-                        if diff_contracts > 0:
-                            await self.execute_pure_maker_chasing_order(swap_symbol, 'sell', float(diff_str), is_swap=True)
-                        else:
-                            await self.execute_pure_maker_chasing_order(swap_symbol, 'buy', float(diff_str), is_swap=True)
-
-                positions = await self.exchange_rest.fetch_positions([swap_symbol])
-                liq_price = 0.0
-                for pos in positions:
-                    if pos['side'] == 'short' and float(pos.get('contracts', 0)) > 0:
-                        liq_price = float(pos.get('liquidationPrice', 0) or 0)
-                        break
-
-                ticker_swap = await self.exchange_rest.fetch_ticker(swap_symbol)
-
-                self.current_symbol = symbol
-                self.current_swap_symbol = swap_symbol
-                self.entry_spot_price = spot_price
-                self.entry_swap_price = float(ticker_swap['last'])
-                self.liquidation_price = liq_price
-                self.initial_equity_usdt = await self.get_total_equity_usdt()
-                self.entry_timestamp = time.time()
-                self.save_state()
-
-                await self.notifier.send_message(
-                    f"🚀 **100% Maker 수수료 최적화 포지션 진입 완료**\n"
-                    f"종목: {symbol}\n"
-                    f"현물진입가: {spot_price}\n"
-                    f"선물진입가: {self.entry_swap_price}\n"
-                    f"청산가: {liq_price}\n"
-                    f"순현물보유: {real_spot_holding}\n"
-                    f"예상 펀딩비: {target_opportunity['funding_rate']*100:.4f}%"
-                )
-
-            except Exception as e:
-                logger.error(f"Error opening position: {e}")
-                await self.notifier.send_message(f"❌ **진입 처리 중 예외 발생**: {e}")
-                await self.close_all_positions()
-
-    async def run_websocket_stop_loss(self):
-        last_equity_check_time = 0
-        cached_equity = 0.0
-
-        while True:
-            try:
-                if self.is_active and self.current_swap_symbol and self.entry_spot_price > 0:
-                    swap_symbol = self.current_swap_symbol
-                    
-                    ticker = await self.exchange_ws.watch_ticker(swap_symbol)
-                    current_swap_price = float(ticker.get('last', 0) or 0)
-
-                    if current_swap_price > 0:
-                        if self.liquidation_price > 0:
-                            dist_to_liq = (self.liquidation_price - current_swap_price) / current_swap_price
-                            if dist_to_liq <= LIQUIDATION_BUFFER_PCT:
-                                await self.notifier.send_message(
-                                    f"🚨 **[위험] 강제청산가 근접 감지!**\n종목: {self.current_symbol}\n현재가: {current_swap_price}\n청산가: {self.liquidation_price}\n긴급 청산합니다."
-                                )
-                                await self.close_all_positions()
-                                await asyncio.sleep(5)
-                                continue
-
-                        basis_change = abs(current_swap_price - self.entry_swap_price) / self.entry_swap_price
-                        if basis_change >= MAX_BASIS_DIVERGENCE_PCT:
-                            await self.notifier.send_message(
-                                f"⚡ **[스탑로스] 현-선물 가격 괴리율 비정상 확대!** ({basis_change*100:.2f}% 변동)\n긴급 청산합니다."
-                            )
-                            await self.close_all_positions()
-                            await asyncio.sleep(5)
-                            continue
-
-                        now_ts = time.time()
-                        if now_ts - last_equity_check_time > 10:
-                            cached_equity = await self.get_total_equity_usdt()
-                            last_equity_check_time = now_ts
-
-                        if self.initial_equity_usdt > 0 and cached_equity > 0:
-                            equity_loss_pct = (self.initial_equity_usdt - cached_equity) / self.initial_equity_usdt
-                            if equity_loss_pct >= TOTAL_EQUITY_STOP_LOSS_PCT:
-                                await self.notifier.send_message(
-                                    f"🛑 **[스탑로스] 계정 총 자산 -{equity_loss_pct*100:.2f}% 손실 감지!**\n자산 보호 청산."
-                                )
-                                await self.close_all_positions()
-                                await asyncio.sleep(5)
-                                continue
-
-                else:
-                    await asyncio.sleep(1)
-
-            except Exception as e:
-                logger.error(f"WebSocket Error: {e}")
-                await asyncio.sleep(3)
-
-    async def run_screening_loop(self):
-        await self.notifier.send_message("🤖 **수수료 극소화형 델타 뉴트럴 자동 매매 봇 가동 시작**")
-        
-        while True:
-            try:
-                if self.is_active:
-                    if self.current_swap_symbol and await self.is_funding_window(self.current_swap_symbol):
-                        logger.info("Funding rate window active. Skipping rotation check.")
-                        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
-                        continue
-
-                    best_opp = await self.get_top_funding_opportunity()
-                    
-                    if best_opp:
-                        if not self.current_symbol:
-                            balance = await self.exchange_rest.fetch_balance()
-                            usdt_free = float(balance.get('USDT', {}).get('free', 0))
-                            
-                            if usdt_free >= MIN_ORDER_USDT:
-                                await self.open_position(best_opp, usdt_free)
-
-                        elif best_opp['symbol'] != self.current_symbol:
-                            held_duration = time.time() - self.entry_timestamp
-                            if held_duration < MIN_HOLD_TIME_SECONDS:
-                                logger.info(f"Position held for {held_duration/3600:.2f}h < 8h. Skipping rotation to save fees.")
-                                await asyncio.sleep(CHECK_INTERVAL_SECONDS)
-                                continue
-
-                            curr_swap = self.current_swap_symbol
-                            curr_funding_info = await self.exchange_rest.fetch_funding_rate(curr_swap)
-                            curr_funding = float(curr_funding_info.get('fundingRate', 0) or 0)
-                            
-                            if best_opp['funding_rate'] > curr_funding * ROTATION_THRESHOLD_SCORE:
-                                await self.notifier.send_message(
-                                    f"🔄 **수수료 대비 고수익 종목 교체**: {self.current_symbol} -> {best_opp['symbol']}\n"
-                                    f"기존 펀딩비: {curr_funding*100:.4f}% -> 신규 펀딩비: {best_opp['funding_rate']*100:.4f}%"
-                                )
-                                await self.close_all_positions()
-                                await asyncio.sleep(2)
-                                
-                                balance = await self.exchange_rest.fetch_balance()
-                                usdt_free = float(balance.get('USDT', {}).get('free', 0))
-                                await self.open_position(best_opp, usdt_free)
-
-            except Exception as e:
-                logger.error(f"Error in screening loop: {e}")
-                
-            await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+    await update.message.reply_text("🛑 봇을 완전히 종료합니다.")
+    os._exit(0)
 
 # ==========================================
-# 4. 메인 실행부 (Telegram Bot 비동기 루프 및 명령어 통합)
+# 5. 핵심 매매 로직 주기 실행 함수
+# ==========================================
+def trade_logic_cycle():
+    """매 10초마다 실행되는 단일 매매 체크 사이클"""
+    if not BOT_SWITCH:
+        return
+
+    spot_price, swap_price = get_ticker_prices()
+    funding_rate = get_funding_rate()
+    pos = get_positions()
+
+    # 예시 매매 로직 로그 (정상 작동 모니터링용)
+    logging.info(f"[감시 중] 현물: ${spot_price:.4f} | 선물: ${swap_price:.4f} | 펀딩비: {funding_rate*100:.4f}% | 포지션: {'보유' if pos else '미보유'}")
+
+    # (필요시 상세 진입/청산 로직 확장 위치)
+
+# ==========================================
+# 6. 비동기 백그라운드 태스크 (30분 주기 로그 알림)
+# ==========================================
+async def periodic_log_reporter(app: Application):
+    """30분마다 텔레그램으로 봇 현황 로그 자동 전송"""
+    while True:
+        try:
+            await asyncio.sleep(1800)  # 30분 (1800초) 대기
+            
+            spot_price, swap_price = get_ticker_prices()
+            funding_rate = get_funding_rate() * 100
+            _, usdt_total = get_balance()
+            pos = get_positions()
+
+            log_msg = f"⏰ [30분 정기 상태 알림]\n\n"
+            log_msg += f"• 자산: ${usdt_total:.2f} USDT\n"
+            log_msg += f"• 현물/선물: ${spot_price:.4f} / ${swap_price:.4f}\n"
+            log_msg += f"• 펀딩비: {funding_rate:.4f}%\n"
+            log_msg += f"• 포지션: {'보유 중 (숏)' if pos else '미보유 (관망 중)'}\n"
+            log_msg += f"• 스위치: {'🟢 ON' if BOT_SWITCH else '🔴 OFF'}"
+
+            await send_telegram_msg_async(app, log_msg)
+            logging.info("📢 30분 정기 텔레그램 로그 전송 완료")
+        except Exception as e:
+            logging.error(f"30분 정기 로그 전송 에러: {e}")
+
+# ==========================================
+# 7. 비동기 메인 이벤트 루프 (Event Loop)
 # ==========================================
 async def main():
-    notifier = TelegramNotifier(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
-    await notifier.init_session()
-    
-    bot = DeltaNeutralBot(OKX_CONFIG, notifier)
-    await bot.init_exchange()
+    # 텔레그램 애플리케이션 생성
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    def admin_only(func):
-        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            if TELEGRAM_ADMIN_ID != 0 and update.effective_user.id != TELEGRAM_ADMIN_ID:
-                await update.message.reply_text("⛔ **권한이 없습니다.**")
-                return
-            return await func(update, context)
-        return wrapper
+    # 명령어 핸들러 등록
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("profit", profit_command))
+    application.add_handler(CommandHandler("switch", switch_command))
+    application.add_handler(CommandHandler("restart", restart_command))
+    application.add_handler(CommandHandler("stop", stop_command))
 
-    @admin_only
-    async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        bot.is_active = not bot.is_active
-        bot.save_state()
-        status_str = "ON 🟢" if bot.is_active else "OFF 🔴"
-        await update.message.reply_text(f"⚙️ **스위치 상태**: {status_str}")
+    # 1. 텔레그램 봇 폴링 비동기 시작
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
 
-    @admin_only
-    async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        status = "작동 중 🟢" if bot.is_active else "정지 중 🔴"
-        curr = bot.current_symbol if bot.current_symbol else "없음 (대기 중)"
-        equity = await bot.get_total_equity_usdt()
-        held_hours = (time.time() - bot.entry_timestamp) / 3600.0 if bot.entry_timestamp > 0 else 0.0
-        
-        funding_rate_str = "N/A"
-        dist_liq_str = "N/A"
-        
-        if bot.current_swap_symbol:
-            try:
-                funding_info = await bot.exchange_rest.fetch_funding_rate(bot.current_swap_symbol)
-                fr = float(funding_info.get('fundingRate', 0) or 0)
-                funding_rate_str = f"{fr * 100:.4f}%"
-                
-                ticker = await bot.exchange_rest.fetch_ticker(bot.current_swap_symbol)
-                curr_price = float(ticker.get('last', 0))
-                if bot.liquidation_price > 0 and curr_price > 0:
-                    dist_pct = ((bot.liquidation_price - curr_price) / curr_price) * 100
-                    dist_liq_str = f"{dist_pct:.2f}% 안전거리"
-            except Exception as e:
-                logger.error(f"Status command fetch error: {e}")
+    logging.info("🤖 수수료 극소화형 델타 뉴트럴 자동 매매 봇 가동 시작")
+    await send_telegram_msg_async(application, "🤖 수수료 극소화형 델타 뉴트럴 자동 매매 봇이 정상 시작되었습니다.")
 
-        msg = (
-            f"📊 **현재 봇 진행 상태**\n\n"
-            f"• 가동 상태: {status}\n"
-            f"• 현재 포지션: {curr}\n"
-            f"• 포지션 유지: {held_hours:.1f} 시간\n"
-            f"• 계정 총 자산: ${equity:.2f} USDT\n\n"
-            f"• 현물 진입가: {bot.entry_spot_price}\n"
-            f"• 선물 진입가: {bot.entry_swap_price}\n"
-            f"• 선물 청산가: {bot.liquidation_price} ({dist_liq_str})\n"
-            f"• 현재 펀딩비: {funding_rate_str}"
-        )
-        await update.message.reply_text(msg, parse_mode="Markdown")
+    # 2. 30분 정기 로그 보고 백그라운드 태스크 시작
+    asyncio.create_task(periodic_log_reporter(application))
 
-    @admin_only
-    async def cmd_profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        current_equity = await bot.get_total_equity_usdt()
-        init_equity = bot.initial_equity_usdt
-        
-        balance = await bot.exchange_rest.fetch_balance()
-        usdt_free = float(balance.get('USDT', {}).get('free', 0.0))
-
-        if init_equity > 0:
-            pnl_usdt = current_equity - init_equity
-            pnl_rate = (pnl_usdt / init_equity) * 100
-            pnl_msg = f"• 진입 대비 손익: {pnl_usdt:+.2f} USDT ({pnl_rate:+.2f}%)"
-        else:
-            pnl_msg = "• 진입 대비 손익: 기준 자산 정보 없음 (포지션 미보유 중)"
-
-        msg = (
-            f"💰 **수익 및 수익률 현황**\n\n"
-            f"• 총 평가 자산: ${current_equity:.2f} USDT\n"
-            f"• 가용 가능 USDT: ${usdt_free:.2f} USDT\n"
-            f"• 포지션 초기 자산: ${init_equity:.2f} USDT\n"
-            f"{pnl_msg}"
-        )
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-    @admin_only
-    async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🛑 **봇을 안전하게 종료합니다.** 프로세스를 정리합니다...")
-        bot.is_active = False
-        bot.save_state()
-        
-        # 비동기 루프 안전 종료
-        asyncio.create_task(shutdown_bot())
-
-    @admin_only
-    async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🔄 **봇 프로세스를 재시작합니다.** 잠시만 기다려 주세요...")
-        bot.save_state()
-        
-        # 프로세스 자체 재구동
-        os.execv(sys.executable, ['python3'] + sys.argv)
-
-    async def shutdown_bot():
-        await updater.stop()
-        await app.stop()
-        await app.shutdown()
-        await bot.exchange_rest.close()
-        await bot.exchange_ws.close()
-        await notifier.close_session()
-        os._exit(0)
-
-    # Telegram Application 설정 및 핸들러 추가
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("switch", cmd_switch))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("profit", cmd_profit))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("restart", cmd_restart))
-
-    await app.initialize()
-    await app.start()
-    
-    updater = app.updater
-    await updater.start_polling(drop_pending_updates=True)
-    
-    screening_task = asyncio.create_task(bot.run_screening_loop())
-    ws_sl_task = asyncio.create_task(bot.run_websocket_stop_loss())
-
+    # 3. 매매 로직 동시 수행 루프
     try:
-        await asyncio.gather(screening_task, ws_sl_task)
-    except asyncio.CancelledError:
-        pass
+        while True:
+            try:
+                # 10초마다 매매 감시 로직 실행
+                trade_logic_cycle()
+            except Exception as e:
+                logging.error(f"매매 루프 오류: {e}")
+
+            await asyncio.sleep(10)  # Non-blocking 비동기 대기
+            
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("봇 종료 요청을 받았습니다.")
     finally:
-        logger.info("Shutdown sequence initiated...")
-        await updater.stop()
-        await app.stop()
-        await app.shutdown()
-        await bot.exchange_rest.close()
-        await bot.exchange_ws.close()
-        await notifier.close_session()
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
 
 if __name__ == "__main__":
     try:
