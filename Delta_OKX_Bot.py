@@ -71,7 +71,7 @@ SYMBOL_SPOT = "XRP/USDT"
 SYMBOL_SWAP = "XRP/USDT:USDT"
 
 COIN_SPEC = {
-    'ctVal': 10.0,            # 선물 1장당 코인 개수
+    'ctVal': 10.0,             # 선물 1장당 코인 개수
     'spot_amount_prec': 2,    # 현물 수량 소수점 자릿수
     'swap_amount_prec': 0,    # 선물 수량 소수점 자릿수
     'spot_min_amount': 1.0,   # 현물 최소 주문 수량
@@ -369,7 +369,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os._exit(0)
 
 # ==========================================
-# 6. 정밀 주문 및 청산 집행 함수
+# 6. 정밀 주문 및 청산 집행 함수 (수정됨)
 # ==========================================
 def execute_delta_neutral_entry():
     """소수점 버림 보정을 적용한 델타 0(뉴트럴) 진입 주문"""
@@ -399,7 +399,7 @@ def execute_delta_neutral_entry():
     try:
         logging.info(f"🚀 [주문 시도] 현물 매수: {spot_amount} {TARGET_COIN} | 선물 숏: {swap_contracts} 계약")
 
-        # 현물 매수 (tdMode 파라미터를 완전히 제거하여 오류 방지)
+        # 현물 매수
         spot_order = okx.create_order(
             symbol=SYMBOL_SPOT,
             type='market',
@@ -407,13 +407,12 @@ def execute_delta_neutral_entry():
             amount=spot_amount
         )
 
-        # 선물 숏 매도 (선물 교차 마진용 tdMode='cross'만 적용)
+        # 선물 숏 매도 (tdMode 파라미터를 완전히 제거하여 계정 거래 모드 충돌 방지)
         swap_order = okx.create_order(
             symbol=SYMBOL_SWAP,
             type='market',
             side='sell',
-            amount=swap_contracts,
-            params={'tdMode': 'cross'}
+            amount=swap_contracts
         )
 
         POSITION_BASE_USDT = usdt_total
@@ -442,13 +441,13 @@ def execute_delta_neutral_exit(reason: str = "펀딩비 청산 조건 도달") -
         if pos:
             contracts = float(pos.get('contracts', 0))
             if contracts > 0:
-                # ✅ 선물 청산 시에도 tdMode='cross' 명시
+                # 선물 청산 시에도 tdMode를 제거하고 reduceOnly 옵션만 적용
                 okx.create_order(
                     symbol=SYMBOL_SWAP,
                     type='market',
                     side='buy',
                     amount=contracts,
-                    params={'reduceOnly': True, 'tdMode': 'cross'}
+                    params={'reduceOnly': True}
                 )
                 logging.info(f"✅ 선물 숏 포지션 청산 완료: {contracts} 계약")
 
