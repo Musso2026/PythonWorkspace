@@ -38,7 +38,7 @@ MIN_FUNDING_RATE = 0.0001
 EXIT_FUNDING_RATE = 0.0000 
 
 # 💰 1회 진입 시 사용할 USDT 금액
-ENTRY_USDT_AMOUNT = 100.0 
+ENTRY_USDT_AMOUNT = 150.0 
 
 # 로깅 설정
 logging.basicConfig(
