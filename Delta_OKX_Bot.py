@@ -93,11 +93,11 @@ def truncate_value(val: float, precision: int) -> float:
 def setup_exchange_account_mode(swap_symbol: str):
     """OKX 레버리지(1x) 및 Cross(교차) 마진 모드 자동 설정 및 체크"""
     try:
-        # 레버리지 1배, Cross 마진 모드 설정
+        # ✅ Multi-currency 마진 모드 규격에 맞는 mgnMode 적용
         okx.set_leverage(1, swap_symbol, params={'mgnMode': 'cross'})
         logging.info(f"✅ {swap_symbol} 교차(Cross) 마진 1배 설정 완료")
     except Exception as e:
-        logging.warning(f"⚠️ 마진 모드 설정 중 참고사항 (OKX 웹에서 Single-currency margin 이상으로 설정되어 있어야 함): {e}")
+        logging.warning(f"⚠️ 마진 모드 설정 중 참고사항: {e}")
 
 def update_coin_spec(coin_symbol: str):
     """OKX에서 해당 코인의 정밀도, 최소 주문 수량, 마진 모드 설정"""
@@ -407,12 +407,13 @@ def execute_delta_neutral_entry():
             amount=spot_amount
         )
 
-        # 선물 숏 매도
+        # ✅ 선물 숏 매도 (OKX Multi-currency 모드용 tdMode='cross' 파라미터 적용)
         swap_order = okx.create_order(
             symbol=SYMBOL_SWAP,
             type='market',
             side='sell',
-            amount=swap_contracts
+            amount=swap_contracts,
+            params={'tdMode': 'cross'}
         )
 
         POSITION_BASE_USDT = usdt_total
@@ -441,12 +442,13 @@ def execute_delta_neutral_exit(reason: str = "펀딩비 청산 조건 도달") -
         if pos:
             contracts = float(pos.get('contracts', 0))
             if contracts > 0:
+                # ✅ 선물 청산 시에도 tdMode='cross' 명시
                 okx.create_order(
                     symbol=SYMBOL_SWAP,
                     type='market',
                     side='buy',
                     amount=contracts,
-                    params={'reduceOnly': True}
+                    params={'reduceOnly': True, 'tdMode': 'cross'}
                 )
                 logging.info(f"✅ 선물 숏 포지션 청산 완료: {contracts} 계약")
 
@@ -543,7 +545,7 @@ async def main():
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("profit", profit_command))
     application.add_handler(CommandHandler("setcoin", setcoin_command))
-    application.add_handler(CommandHandler("close", close_command))  # 👈 수동 청산 명령어 추가
+    application.add_handler(CommandHandler("close", close_command))  # 수동 청산 명령어
     application.add_handler(CommandHandler("switch", switch_command))
     application.add_handler(CommandHandler("restart", restart_command))
     application.add_handler(CommandHandler("stop", stop_command))
