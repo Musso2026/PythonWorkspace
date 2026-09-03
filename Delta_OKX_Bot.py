@@ -74,11 +74,11 @@ SYMBOL_SPOT = "XRP/USDT"
 SYMBOL_SWAP = "XRP/USDT:USDT"
 
 COIN_SPEC = {
-    'ctVal': 10.0,             # 선물 1장당 코인 개수
-    'spot_amount_prec': 2,    # 현물 수량 소수점 자릿수
-    'swap_amount_prec': 0,    # 선물 수량 소수점 자릿수
-    'spot_min_amount': 1.0,   # 현물 최소 주문 수량
-    'swap_min_amount': 1.0,   # 선물 최소 주문 수량
+    'ctVal': 10.0,              # 선물 1장당 코인 개수
+    'spot_amount_prec': 2,     # 현물 수량 소수점 자릿수
+    'swap_amount_prec': 0,     # 선물 수량 소수점 자릿수
+    'spot_min_amount': 1.0,    # 현물 최소 주문 수량
+    'swap_min_amount': 1.0,    # 선물 최소 주문 수량
 }
 
 POSITION_BASE_USDT = 0.0  # 포지션 진입 시점 원금
@@ -412,13 +412,14 @@ def execute_delta_neutral_entry():
         )
         logging.info(f"✅ 선물 숏 체결 성공: {swap_contracts} 계약")
 
-        # 2. 현물 매수 집행
+        # 2. 현물 매수 집행 (tdMode: cash 적용으로 Parameter tdMode error 해결)
         try:
             spot_order = okx.create_order(
                 symbol=SYMBOL_SPOT,
                 type='market',
                 side='buy',
-                amount=spot_amount
+                amount=spot_amount,
+                params={'tdMode': 'cash'}
             )
             logging.info(f"✅ 현물 매수 체결 성공: {spot_amount} {TARGET_COIN}")
             
@@ -437,6 +438,7 @@ def execute_delta_neutral_entry():
                 params={'reduceOnly': True, 'tdMode': 'cross'}
             )
             logging.info("🛡️ 선물 숏 포지션 롤백 완료 (자산 보호 완료)")
+            time.sleep(30)  # 무한 반복 방지를 위한 30초 대기
             return False
 
     except Exception as e:
@@ -470,14 +472,15 @@ def execute_delta_neutral_exit(reason: str = "펀딩비 청산 조건 도달") -
                 )
                 logging.info(f"✅ 선물 숏 포지션 청산 완료: {contracts} 계약")
 
-        # 2. 보유 현물 매도 (Sell Spot)
+        # 2. 보유 현물 매도 (Sell Spot, tdMode: cash 적용)
         spot_amount_to_sell = truncate_value(coin_free, COIN_SPEC['spot_amount_prec'])
         if spot_amount_to_sell >= COIN_SPEC['spot_min_amount']:
             okx.create_order(
                 symbol=SYMBOL_SPOT,
                 type='market',
                 side='sell',
-                amount=spot_amount_to_sell
+                amount=spot_amount_to_sell,
+                params={'tdMode': 'cash'}
             )
             logging.info(f"✅ 현물 매도 완료: {spot_amount_to_sell} {TARGET_COIN}")
 
