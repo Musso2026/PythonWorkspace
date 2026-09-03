@@ -372,7 +372,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os._exit(0)
 
 # ==========================================
-# 6. 정밀 주문 및 청산 집행 함수 (안정성 보완)
+# 6. 정밀 주문 및 청산 집행 함수 (tgtCcy 보완 적용)
 # ==========================================
 def execute_delta_neutral_entry():
     """소수점 버림 보정을 적용한 델타 0(뉴트럴) 진입 주문 (선물 우선 체결 및 안전 롤백 적용)"""
@@ -412,14 +412,17 @@ def execute_delta_neutral_entry():
         )
         logging.info(f"✅ 선물 숏 체결 성공: {swap_contracts} 계약")
 
-        # 2. 현물 매수 집행 (tdMode: cash 적용으로 Parameter tdMode error 해결)
+        # 2. 현물 매수 집행 (tgtCcy: 'base_ccy' 추가로 amount가 수량(XRP)임을 명시하여 51000 에러 해결)
         try:
             spot_order = okx.create_order(
                 symbol=SYMBOL_SPOT,
                 type='market',
                 side='buy',
                 amount=spot_amount,
-                params={'tdMode': 'cash'}
+                params={
+                    'tdMode': 'cash',
+                    'tgtCcy': 'base_ccy'
+                }
             )
             logging.info(f"✅ 현물 매수 체결 성공: {spot_amount} {TARGET_COIN}")
             
@@ -472,7 +475,7 @@ def execute_delta_neutral_exit(reason: str = "펀딩비 청산 조건 도달") -
                 )
                 logging.info(f"✅ 선물 숏 포지션 청산 완료: {contracts} 계약")
 
-        # 2. 보유 현물 매도 (Sell Spot, tdMode: cash 적용)
+        # 2. 보유 현물 매도 (Sell Spot, tgtCcy 명시로 안정성 추가)
         spot_amount_to_sell = truncate_value(coin_free, COIN_SPEC['spot_amount_prec'])
         if spot_amount_to_sell >= COIN_SPEC['spot_min_amount']:
             okx.create_order(
@@ -480,7 +483,10 @@ def execute_delta_neutral_exit(reason: str = "펀딩비 청산 조건 도달") -
                 type='market',
                 side='sell',
                 amount=spot_amount_to_sell,
-                params={'tdMode': 'cash'}
+                params={
+                    'tdMode': 'cash',
+                    'tgtCcy': 'base_ccy'
+                }
             )
             logging.info(f"✅ 현물 매도 완료: {spot_amount_to_sell} {TARGET_COIN}")
 
