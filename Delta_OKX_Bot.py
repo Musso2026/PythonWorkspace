@@ -399,16 +399,15 @@ def execute_delta_neutral_entry():
     try:
         logging.info(f"🚀 [주문 시도] 현물 매수: {spot_amount} {TARGET_COIN} | 선물 숏: {swap_contracts} 계약")
 
-        # 현물 매수 (Multi-currency 모드용 tdMode='cash' 파라미터 적용)
+        # 현물 매수 (tdMode 파라미터를 완전히 제거하여 오류 방지)
         spot_order = okx.create_order(
             symbol=SYMBOL_SPOT,
             type='market',
             side='buy',
-            amount=spot_amount,
-            params={'tdMode': 'cash'}
+            amount=spot_amount
         )
 
-        # 선물 숏 매도 (OKX Multi-currency 모드용 tdMode='cross' 파라미터 적용)
+        # 선물 숏 매도 (선물 교차 마진용 tdMode='cross'만 적용)
         swap_order = okx.create_order(
             symbol=SYMBOL_SWAP,
             type='market',
