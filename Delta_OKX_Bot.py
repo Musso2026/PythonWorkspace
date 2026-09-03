@@ -50,14 +50,17 @@ logging.basicConfig(
     ]
 )
 
-# OKX CCXT 객체 생성
+# OKX CCXT 객체 생성 (tdMode 자동 주입 방지를 위해 defaultType을 spot으로 지정)
 def get_okx_client():
     return ccxt.okx({
         'apiKey': API_KEY,
         'secret': SECRET_KEY,
         'password': PASSPHRASE,
         'enableRateLimit': True,
-        'options': {'defaultType': 'swap'}
+        'options': {
+            'defaultType': 'spot',
+            'createMarketBuyOrderRequiresPrice': False
+        }
     })
 
 okx = get_okx_client()
@@ -93,7 +96,6 @@ def truncate_value(val: float, precision: int) -> float:
 def setup_exchange_account_mode(swap_symbol: str):
     """OKX 레버리지(1x) 및 Cross(교차) 마진 모드 자동 설정 및 체크"""
     try:
-        # ✅ Multi-currency 마진 모드 규격에 맞는 mgnMode 적용
         okx.set_leverage(1, swap_symbol, params={'mgnMode': 'cross'})
         logging.info(f"✅ {swap_symbol} 교차(Cross) 마진 1배 설정 완료")
     except Exception as e:
@@ -330,7 +332,8 @@ async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     pos = get_positions()
-    if not pos:
+    _, _, coin_free = get_balance()
+    if not pos and coin_free <= 0:
         await update.message.reply_text("ℹ️ 현재 청산할 포지션이 없습니다.")
         return
 
@@ -369,10 +372,10 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os._exit(0)
 
 # ==========================================
-# 6. 정밀 주문 및 청산 집행 함수 (수정됨)
+# 6. 정밀 주문 및 청산 집행 함수 (안정성 보완)
 # ==========================================
 def execute_delta_neutral_entry():
-    """소수점 버림 보정을 적용한 델타 0(뉴트럴) 진입 주문"""
+    """소수점 버림 보정을 적용한 델타 0(뉴트럴) 진입 주문 (선물 우선 체결 및 안전 롤백 적용)"""
     global POSITION_BASE_USDT
     
     usdt_free, usdt_total, _ = get_balance()
@@ -397,27 +400,44 @@ def execute_delta_neutral_entry():
         return False
 
     try:
-        logging.info(f"🚀 [주문 시도] 현물 매수: {spot_amount} {TARGET_COIN} | 선물 숏: {swap_contracts} 계약")
+        logging.info(f"🚀 [주문 시도] 선물 숏: {swap_contracts} 계약 | 현물 매수: {spot_amount} {TARGET_COIN}")
 
-        # 현물 매수
-        spot_order = okx.create_order(
-            symbol=SYMBOL_SPOT,
-            type='market',
-            side='buy',
-            amount=spot_amount
-        )
-
-        # 선물 숏 매도 (tdMode 파라미터를 완전히 제거하여 계정 거래 모드 충돌 방지)
+        # 1. 선물 숏 매도 우선 집행 (mgnMode 및 tdMode 명시적 교차 설정)
         swap_order = okx.create_order(
             symbol=SYMBOL_SWAP,
             type='market',
             side='sell',
-            amount=swap_contracts
+            amount=swap_contracts,
+            params={'tdMode': 'cross'}
         )
+        logging.info(f"✅ 선물 숏 체결 성공: {swap_contracts} 계약")
 
-        POSITION_BASE_USDT = usdt_total
-        logging.info("✅ 델타 뉴트럴 진입 체결 완료!")
-        return True
+        # 2. 현물 매수 집행
+        try:
+            spot_order = okx.create_order(
+                symbol=SYMBOL_SPOT,
+                type='market',
+                side='buy',
+                amount=spot_amount
+            )
+            logging.info(f"✅ 현물 매수 체결 성공: {spot_amount} {TARGET_COIN}")
+            
+            POSITION_BASE_USDT = usdt_total
+            logging.info("🎉 델타 뉴트럴 진입 완벽 체결 완료!")
+            return True
+
+        except Exception as spot_err:
+            # 현물 매수 실패 시 즉시 선물 숏 롤백 (긴급 청산)
+            logging.error(f"❌ 현물 매수 실패! 선물 포지션 긴급 롤백(청산) 시도: {spot_err}")
+            okx.create_order(
+                symbol=SYMBOL_SWAP,
+                type='market',
+                side='buy',
+                amount=swap_contracts,
+                params={'reduceOnly': True, 'tdMode': 'cross'}
+            )
+            logging.info("🛡️ 선물 숏 포지션 롤백 완료 (자산 보호 완료)")
+            return False
 
     except Exception as e:
         logging.error(f"❌ 주문 집행 중 에러 발생: {e}")
@@ -441,13 +461,12 @@ def execute_delta_neutral_exit(reason: str = "펀딩비 청산 조건 도달") -
         if pos:
             contracts = float(pos.get('contracts', 0))
             if contracts > 0:
-                # 선물 청산 시에도 tdMode를 제거하고 reduceOnly 옵션만 적용
                 okx.create_order(
                     symbol=SYMBOL_SWAP,
                     type='market',
                     side='buy',
                     amount=contracts,
-                    params={'reduceOnly': True}
+                    params={'reduceOnly': True, 'tdMode': 'cross'}
                 )
                 logging.info(f"✅ 선물 숏 포지션 청산 완료: {contracts} 계약")
 
