@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 # Telegram Bot API (python-telegram-bot v20+)
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.request import HTTPXRequest  # 👈 [추가됨] 네트워크 타임아웃 설정을 위한 라이브러리
 
 # ==========================================
 # 1. 환경 변수 및 기본 설정 (.env 경로 자동 감지)
@@ -75,10 +76,10 @@ SYMBOL_SWAP = "XRP/USDT:USDT"
 
 COIN_SPEC = {
     'ctVal': 10.0,              # 선물 1장당 코인 개수
-    'spot_amount_prec': 2,     # 현물 수량 소수점 자릿수
-    'swap_amount_prec': 0,     # 선물 수량 소수점 자릿수
-    'spot_min_amount': 1.0,    # 현물 최소 주문 수량
-    'swap_min_amount': 1.0,    # 선물 최소 주문 수량
+    'spot_amount_prec': 2,      # 현물 수량 소수점 자릿수
+    'swap_amount_prec': 0,      # 선물 수량 소수점 자릿수
+    'spot_min_amount': 1.0,     # 현물 최소 주문 수량
+    'swap_min_amount': 1.0,     # 선물 최소 주문 수량
 }
 
 POSITION_BASE_USDT = 0.0  # 포지션 진입 시점 원금
@@ -566,7 +567,9 @@ async def main():
     except Exception as e:
         logging.error(f"초기 스펙 설정 에러: {e}")
 
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    # 텔레그램 서버 통신 타임아웃을 30초로 연장 설정하여 TimedOut 오류 방지
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
+    application = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
 
     # 명령어 핸들러 등록
     application.add_handler(CommandHandler("status", status_command))
