@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 # Telegram Bot API (python-telegram-bot v20+)
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.request import HTTPXRequest  # 👈 [추가됨] 네트워크 타임아웃 설정을 위한 라이브러리
+from telegram.request import HTTPXRequest  # 네트워크 타임아웃 설정을 위한 라이브러리
 
 # ==========================================
 # 1. 환경 변수 및 기본 설정 (.env 경로 자동 감지)
@@ -38,9 +38,6 @@ MIN_FUNDING_RATE = 0.0001
 # 🎯 펀딩비 청산 기준 설정 (0.000% 이하로 떨어지면 청산)
 EXIT_FUNDING_RATE = 0.0000 
 
-# 💰 1회 진입 시 사용할 USDT 금액
-ENTRY_USDT_AMOUNT = 150.0 
-
 # 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
@@ -51,7 +48,7 @@ logging.basicConfig(
     ]
 )
 
-# OKX CCXT 객체 생성 (tdMode 자동 주입 방지를 위해 defaultType을 spot으로 지정)
+# OKX CCXT 객체 생성
 def get_okx_client():
     return ccxt.okx({
         'apiKey': API_KEY,
@@ -373,16 +370,18 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os._exit(0)
 
 # ==========================================
-# 6. 정밀 주문 및 청산 집행 함수 (tdMode: cross 적용)
+# 6. 정밀 주문 및 청산 집행 함수 (개선된 진입 로직 적용)
 # ==========================================
 def execute_delta_neutral_entry():
-    """소수점 버림 보정을 적용한 델타 0(뉴트럴) 진입 주문 (선물 우선 체결 및 안전 롤백 적용)"""
+    """가용 잔고(95%) 기반 최적 계약 수 계산 및 델타 뉴트럴 정밀 진입"""
     global POSITION_BASE_USDT
     
     usdt_free, usdt_total, _ = get_balance()
-    target_usdt = min(ENTRY_USDT_AMOUNT, usdt_free * 0.95)
 
-    if target_usdt < 10.0:
+    # 1. 가용 잔고의 95% 범위 계산 (안전 여유금 5% 확보)
+    available_usdt = usdt_free * 0.95
+
+    if available_usdt < 10.0:
         logging.warning("⚠️ 주문 가능한 USDT 잔고가 부족합니다 (최소 10 USDT 필요).")
         return False
 
@@ -390,20 +389,22 @@ def execute_delta_neutral_entry():
     if spot_price <= 0 or swap_price <= 0:
         return False
 
-    raw_spot_amount = target_usdt / spot_price
-    spot_amount = truncate_value(raw_spot_amount, COIN_SPEC['spot_amount_prec'])
-    
-    raw_swap_contracts = spot_amount / COIN_SPEC['ctVal']
-    swap_contracts = truncate_value(raw_swap_contracts, COIN_SPEC['swap_amount_prec'])
+    # 2. 가용 잔고(95%) 내에서 체결 가능한 선물 계약 수(Cont)를 우선 계산
+    cost_per_contract = swap_price * COIN_SPEC['ctVal']
+    max_contracts = math.floor(available_usdt / cost_per_contract)
+    swap_contracts = truncate_value(float(max_contracts), COIN_SPEC['swap_amount_prec'])
+
+    # 3. 선물 계약 수(Cont) 수량에 맞춰 정확한 현물 수량 산정 (완벽한 델타 0 유지)
+    spot_amount = truncate_value(swap_contracts * COIN_SPEC['ctVal'], COIN_SPEC['spot_amount_prec'])
 
     if spot_amount < COIN_SPEC['spot_min_amount'] or swap_contracts < COIN_SPEC['swap_min_amount']:
-        logging.warning(f"⚠️ 주문 수량이 거래소 최소 주문 단위보다 적습니다. (현물: {spot_amount}, 선물: {swap_contracts})")
+        logging.warning(f"⚠️ 주문 가능 수량이 거래소 최소 주문 단위보다 적습니다. (현물: {spot_amount}, 선물: {swap_contracts})")
         return False
 
     try:
         logging.info(f"🚀 [주문 시도] 선물 숏: {swap_contracts} 계약 | 현물 매수: {spot_amount} {TARGET_COIN}")
 
-        # 1. 선물 숏 매도 우선 집행 (mgnMode 및 tdMode 명시적 교차 설정)
+        # 1. 선물 숏 매도 우선 집행
         swap_order = okx.create_order(
             symbol=SYMBOL_SWAP,
             type='market',
@@ -413,7 +414,7 @@ def execute_delta_neutral_entry():
         )
         logging.info(f"✅ 선물 숏 체결 성공: {swap_contracts} 계약")
 
-        # 2. 현물 매수 집행 (tdMode: 'cross'로 지정하여 마진/교차 계정의 51000 에러 해결)
+        # 2. 현물 매수 집행
         try:
             spot_order = okx.create_order(
                 symbol=SYMBOL_SPOT,
@@ -432,7 +433,7 @@ def execute_delta_neutral_entry():
             return True
 
         except Exception as spot_err:
-            # 현물 매수 실패 시 즉시 선물 숏 롤백 (긴급 청산)
+            # 현물 매수 실패 시 선물 숏 포지션 롤백 (긴급 청산)
             logging.error(f"❌ 현물 매수 실패! 선물 포지션 긴급 롤백(청산) 시도: {spot_err}")
             okx.create_order(
                 symbol=SYMBOL_SWAP,
@@ -442,7 +443,7 @@ def execute_delta_neutral_entry():
                 params={'reduceOnly': True, 'tdMode': 'cross'}
             )
             logging.info("🛡️ 선물 숏 포지션 롤백 완료 (자산 보호 완료)")
-            time.sleep(30)  # 무한 반복 방지를 위한 30초 대기
+            time.sleep(30)
             return False
 
     except Exception as e:
@@ -476,7 +477,7 @@ def execute_delta_neutral_exit(reason: str = "펀딩비 청산 조건 도달") -
                 )
                 logging.info(f"✅ 선물 숏 포지션 청산 완료: {contracts} 계약")
 
-        # 2. 보유 현물 매도 (Sell Spot, tdMode: 'cross' 적용)
+        # 2. 보유 현물 매도
         spot_amount_to_sell = truncate_value(coin_free, COIN_SPEC['spot_amount_prec'])
         if spot_amount_to_sell >= COIN_SPEC['spot_min_amount']:
             okx.create_order(
@@ -523,7 +524,7 @@ def trade_logic_cycle():
         logging.info(f"🚀 {TARGET_COIN} 진입 조건 충족! (펀딩비: {funding_rate*100:.4f}%)")
         execute_delta_neutral_entry()
 
-    # 2. 포지션 보유 시 청산 조건 판단 (펀딩비 0.000% 이하 하락 시)
+    # 2. 포지션 보유 시 청산 조건 판단
     elif pos and funding_rate <= EXIT_FUNDING_RATE:
         logging.info(f"📉 {TARGET_COIN} 청산 조건 충족! (현재 펀딩비: {funding_rate*100:.4f}% <= 목표: {EXIT_FUNDING_RATE*100:.3f}%)")
         execute_delta_neutral_exit("펀딩비 하락 청산")
@@ -560,27 +561,23 @@ async def periodic_log_reporter(app: Application):
 # 9. 비동기 메인 이벤트 루프
 # ==========================================
 async def main():
-    # 최초 가동 시 타겟 코인(XRP) 스펙 및 마진 모드 자동 조회
     try:
         update_coin_spec(TARGET_COIN)
         logging.info(f"기본 코인 스펙 설정 완료: {TARGET_COIN} (1ct = {COIN_SPEC['ctVal']})")
     except Exception as e:
         logging.error(f"초기 스펙 설정 에러: {e}")
 
-    # 텔레그램 서버 통신 타임아웃을 30초로 연장 설정하여 TimedOut 오류 방지
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     application = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
 
-    # 명령어 핸들러 등록
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("profit", profit_command))
     application.add_handler(CommandHandler("setcoin", setcoin_command))
-    application.add_handler(CommandHandler("close", close_command))  # 수동 청산 명령어
+    application.add_handler(CommandHandler("close", close_command))
     application.add_handler(CommandHandler("switch", switch_command))
     application.add_handler(CommandHandler("restart", restart_command))
     application.add_handler(CommandHandler("stop", stop_command))
 
-    # 1. 텔레그램 봇 비동기 시작
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
@@ -594,10 +591,8 @@ async def main():
         f"• 청산 펀딩비: {EXIT_FUNDING_RATE*100:.3f}%"
     )
 
-    # 2. 30분 정기 로그 보고 백그라운드 태스크 시작
     asyncio.create_task(periodic_log_reporter(application))
 
-    # 3. 매매 로직 동시 수행 루프
     try:
         while True:
             try:
