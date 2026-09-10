@@ -443,6 +443,16 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_str = "🟢 ON (가동)" if BOT_SWITCH else "🔴 OFF (일시 정지)"
     await update.message.reply_text(f"🔄 봇 매매 스위치가 {status_str} 상태로 변경되었습니다.")
 
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start 명령어 (일시정지 후 재개)"""
+    if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
+        return
+
+    global BOT_SWITCH
+    BOT_SWITCH = True
+    await update.message.reply_text(f"▶️ **봇 동작을 시작/재개합니다.** (현재 타겟: {TARGET_COIN})")
+    logging.info(f"텔레그램 명령어 봇 재개 (/start) - 대상: {TARGET_COIN}")
+
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/restart 명령"""
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
@@ -451,10 +461,20 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os.execv(sys.executable, ['python3'] + sys.argv)
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/stop 명령"""
+    """/stop 명령 (프로세스 종료 대신 일시 정지)"""
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
-    await update.message.reply_text("🛑 봇을 완전히 종료합니다.")
+    global BOT_SWITCH
+    BOT_SWITCH = False
+    await update.message.reply_text("⏸️ **봇 매매를 일시 정지합니다.**\n(텔레그램 명령어 수신은 계속 유지되며, `/start`로 재개할 수 있습니다.)")
+    logging.info("텔레그램 명령어 봇 일시 정지 (/stop)")
+
+async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/kill 명령 (프로세스 완전 종료)"""
+    if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
+        return
+    await update.message.reply_text("💀 **봇 프로세스를 완전히 종료합니다.**")
+    logging.info("텔레그램 명령어 봇 완전 종료 (/kill)")
     os._exit(0)
 
 # ==========================================
@@ -645,6 +665,7 @@ async def main():
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     application = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
 
+    application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("profit", profit_command))
     application.add_handler(CommandHandler("setfund", setfund_command))
@@ -654,6 +675,7 @@ async def main():
     application.add_handler(CommandHandler("switch", switch_command))
     application.add_handler(CommandHandler("restart", restart_command))
     application.add_handler(CommandHandler("stop", stop_command))
+    application.add_handler(CommandHandler("kill", kill_command))
 
     await application.initialize()
     await application.start()
