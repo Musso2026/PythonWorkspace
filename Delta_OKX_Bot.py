@@ -5,6 +5,7 @@ import math
 import logging
 import asyncio
 from datetime import datetime, timezone
+import ccxt.async_support as ccxt_async  # 초고속 비동기 처리를 위한 async ccxt
 import ccxt
 from dotenv import load_dotenv
 
@@ -35,9 +36,10 @@ TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID")
 # 💰 [원화 약 20만원 상당 USDT 입금 원금 설정]
 INITIAL_DEPOSIT_USDT = float(os.getenv("INITIAL_DEPOSIT_USDT", 145.00))
 
-# 🎯 펀딩비 설정 (진입 0.025%, 청산 0.005%)
-MIN_FUNDING_RATE = 0.00025  # 0.025%
-EXIT_FUNDING_RATE = 0.00005 # 0.005% (수수료 및 손익 방어 안정선)
+# 🎯 펀딩비 및 안전 하한선 설정
+MIN_FUNDING_RATE = 0.0001    # 실시간 동적 설정 (기본값)
+EXIT_FUNDING_RATE = 0.00005   # 청산 하한선 (기본 0.005%)
+ABSOLUTE_MIN_FUNDING = 0.0001 # 🚨 절댓값 하한선 0.01% (이하는 절대 진입 금지)
 
 # 로깅 설정
 logging.basicConfig(
@@ -49,7 +51,7 @@ logging.basicConfig(
     ]
 )
 
-# OKX CCXT 객체 생성
+# 동기식 CCXT (텔레그램 단순 스펙 변경용) 및 비동기 CCXT (초고속 매매용)
 def get_okx_client():
     return ccxt.okx({
         'apiKey': API_KEY,
@@ -62,7 +64,20 @@ def get_okx_client():
         }
     })
 
+def get_async_okx_client():
+    return ccxt_async.okx({
+        'apiKey': API_KEY,
+        'secret': SECRET_KEY,
+        'password': PASSPHRASE,
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'spot',
+            'createMarketBuyOrderRequiresPrice': False
+        }
+    })
+
 okx = get_okx_client()
+async_okx = get_async_okx_client()
 
 # ==========================================
 # 글로벌 변수 및 코인 스펙 상태 관리
@@ -125,7 +140,6 @@ def update_coin_spec(coin_symbol: str):
     COIN_SPEC['spot_min_amount'] = float(spot_m['limits']['amount']['min']) if spot_m['limits']['amount']['min'] else 0.0001
     COIN_SPEC['swap_min_amount'] = float(swap_m['limits']['amount']['min']) if swap_m['limits']['amount']['min'] else 1.0
 
-    # 코인이 바뀌어도 설정된 레버리지 고정 반영
     setup_exchange_account_mode(SYMBOL_SWAP, TARGET_LEVERAGE)
 
 # ==========================================
@@ -154,8 +168,19 @@ def get_usdt_krw_rate() -> float:
             logging.error(f"환율 조회 실패 (기본 환율 1,350원 적용): {e}")
             return 1350.0
 
+async def get_ticker_prices_async():
+    """비동기 초고속 현물 및 선물 현재가 조회"""
+    try:
+        spot_task = async_okx.fetch_ticker(SYMBOL_SPOT)
+        swap_task = async_okx.fetch_ticker(SYMBOL_SWAP)
+        spot_ticker, swap_ticker = await asyncio.gather(spot_task, swap_task)
+        return float(spot_ticker['last']), float(swap_ticker['last'])
+    except Exception as e:
+        logging.error(f"시세 조회 에러: {e}")
+        return 0.0, 0.0
+
 def get_ticker_prices():
-    """현물 및 선물 현재가 조회"""
+    """동기 시세 조회 (텔레그램 명령 처리용)"""
     try:
         spot_ticker = okx.fetch_ticker(SYMBOL_SPOT)
         swap_ticker = okx.fetch_ticker(SYMBOL_SWAP)
@@ -167,8 +192,20 @@ def get_ticker_prices():
 # ==========================================
 # 4. 정밀 자산 및 포지션 조회
 # ==========================================
+async def get_positions_async():
+    """비동기 초고속 선물 포지션 조회"""
+    try:
+        positions = await async_okx.fetch_positions([SYMBOL_SWAP])
+        for pos in positions:
+            if pos['symbol'] == SYMBOL_SWAP and float(pos['contracts']) > 0:
+                return pos
+        return None
+    except Exception as e:
+        logging.error(f"포지션 조회 에러: {e}")
+        return None
+
 def get_positions():
-    """현재 선물 포지션 조회"""
+    """동기 포지션 조회"""
     try:
         positions = okx.fetch_positions([SYMBOL_SWAP])
         for pos in positions:
@@ -180,10 +217,7 @@ def get_positions():
         return None
 
 def get_balance():
-    """
-    (현물 보유 수량 전체 가치 + 가용 USDT + 선물 미실현 손익) 정밀 합산
-    Returns: (usdt_free, pure_bot_equity, coin_total, spot_val_krw)
-    """
+    """동기 자산 정밀 합산"""
     try:
         balance = okx.fetch_balance()
         krw_rate = get_usdt_krw_rate()
@@ -210,6 +244,33 @@ def get_balance():
         logging.error(f"잔고 조회 에러: {e}")
         return 0.0, 0.0, 0.0, 0.0
 
+async def get_balance_async():
+    """비동기 초고속 자산 합산"""
+    try:
+        balance_task = async_okx.fetch_balance()
+        price_task = get_ticker_prices_async()
+        pos_task = get_positions_async()
+        
+        balance, (spot_price, swap_price), pos = await asyncio.gather(balance_task, price_task, pos_task)
+        
+        usdt_free = float(balance['free'].get('USDT', 0.0))
+        coin_total = float(balance['total'].get(TARGET_COIN, 0.0))
+        spot_val_usdt = coin_total * spot_price
+        
+        swap_pnl_usdt = 0.0
+        if pos:
+            swap_pnl_usdt = float(pos.get('unrealizedPnl', 0.0))
+            if swap_pnl_usdt == 0.0 and pos.get('entryPrice'):
+                entry_p = float(pos.get('entryPrice', 0.0))
+                contracts = float(pos.get('contracts', 0.0))
+                swap_pnl_usdt = (entry_p - swap_price) * (contracts * COIN_SPEC['ctVal'])
+
+        pure_bot_equity = usdt_free + spot_val_usdt + swap_pnl_usdt
+        return usdt_free, pure_bot_equity, coin_total
+    except Exception as e:
+        logging.error(f"비동기 잔고 조회 에러: {e}")
+        return 0.0, 0.0, 0.0
+
 def has_open_orders():
     """미체결 주문 존재 여부 확인"""
     try:
@@ -229,8 +290,17 @@ def cancel_all_open_orders():
     except Exception as e:
         logging.error(f"미체결 주문 취소 중 에러: {e}")
 
+async def get_funding_rate_async():
+    """비동기 초고속 펀딩비 조회"""
+    try:
+        funding_info = await async_okx.fetch_funding_rate(SYMBOL_SWAP)
+        return float(funding_info.get('fundingRate', 0.0))
+    except Exception as e:
+        logging.error(f"펀딩비 조회 에러: {e}")
+        return 0.0
+
 def get_funding_rate():
-    """현재 펀딩비 조회"""
+    """동기 펀딩비 조회"""
     try:
         funding_info = okx.fetch_funding_rate(SYMBOL_SWAP)
         return float(funding_info.get('fundingRate', 0.0))
@@ -239,10 +309,85 @@ def get_funding_rate():
         return 0.0
 
 # ==========================================
-# 5. 텔레그램 명령어 핸들러
+# 5. 🔥 거래대금 & 펀딩비 복합 자동 탐색 (나노초 스피드 스캔)
+# ==========================================
+async def find_best_funding_coin(min_volume_usdt: float = 10000000.0):
+    """
+    거래대금과 펀딩비의 복합 가중치를 계산하여 최우선 순위 코인 탐색.
+    0.01% (0.0001) 초과 종목 중 거래대금과 펀딩비가 높은 최적 코인 선택.
+    실시간 펀딩비의 95% 선을 진입 기준으로 자동 설정.
+    """
+    global MIN_FUNDING_RATE, EXIT_FUNDING_RATE, TARGET_COIN
+    try:
+        t_start_ns = time.perf_counter_ns()
+        
+        pos = await get_positions_async()
+        if pos is not None or has_open_orders():
+            return
+
+        tickers = await async_okx.fetch_tickers()
+        
+        candidate_symbols = []
+        for symbol, ticker in tickers.items():
+            if symbol.endswith(':USDT') and '/USDT' in symbol:
+                quote_volume = float(ticker.get('quoteVolume', 0.0) or 0.0)
+                if quote_volume >= min_volume_usdt:
+                    candidate_symbols.append((symbol, symbol.split('/')[0], quote_volume))
+
+        if not candidate_symbols:
+            return
+
+        # 병렬 비동기 펀딩비 일괄 스캔
+        funding_tasks = [async_okx.fetch_funding_rate(sym) for sym, _, _ in candidate_symbols]
+        funding_results = await asyncio.gather(*funding_tasks, return_exceptions=True)
+
+        best_coin = None
+        best_funding = -999.0
+        best_score = -999.0
+
+        for (sym, coin, volume), result in zip(candidate_symbols, funding_results):
+            if isinstance(result, dict) and 'fundingRate' in result:
+                rate = float(result.get('fundingRate', 0.0) or 0.0)
+                
+                # 🚨 [하한선 조건] 실시간 펀딩비가 0.01% (0.0001) 이하일 경우 무조건 제외
+                if rate > ABSOLUTE_MIN_FUNDING:
+                    # 복합 점수 계산: (펀딩비 * 10,000) * log10(거래대금)
+                    score = (rate * 10000.0) * math.log10(volume)
+                    if score > best_score:
+                        best_score = score
+                        best_coin = coin
+                        best_funding = rate
+
+        t_scan_ms = (time.perf_counter_ns() - t_start_ns) / 1_000_000.0
+
+        # 조건 충족하는 최우선 순위 코인 반영
+        if best_coin and best_funding > ABSOLUTE_MIN_FUNDING:
+            if best_coin != TARGET_COIN:
+                logging.info(
+                    f"🔎 [우선순위 코인 변경] {best_coin} 선정! "
+                    f"(실시간 펀딩비: {best_funding*100:.4f}%, 스캔소요: {t_scan_ms:.2f}ms)"
+                )
+                await asyncio.to_thread(update_coin_spec, best_coin)
+
+            # 💡 [핵심] 진입 기준 = 해당 코인 실시간 펀딩비의 95%
+            calculated_entry_rate = best_funding * 0.95
+            
+            # 0.01% 이하로 떨어지지 않도록 안전 하한선 적용
+            MIN_FUNDING_RATE = max(calculated_entry_rate, ABSOLUTE_MIN_FUNDING)
+            EXIT_FUNDING_RATE = max(MIN_FUNDING_RATE * 0.2, 0.00005)
+
+            logging.info(
+                f"🎯 [{TARGET_COIN} 세팅 완료] 실시간: {best_funding*100:.4f}% | "
+                f"진입기준(95%): {MIN_FUNDING_RATE*100:.4f}% | 청산기준: {EXIT_FUNDING_RATE*100:.4f}%"
+            )
+
+    except Exception as e:
+        logging.error(f"최적 코인 탐색 에러: {e}")
+
+# ==========================================
+# 6. 텔레그램 명령어 핸들러
 # ==========================================
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/status 명령어"""
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
 
@@ -262,8 +407,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"📊 [봇 현재 상태 보고 - {TARGET_COIN}]\n\n"
     msg += f"• 스위치 상태: {switch_str}\n"
     msg += f"• 설정 레버리지: {TARGET_LEVERAGE}배\n"
-    msg += f"• 진입 기준 펀딩비: {MIN_FUNDING_RATE * 100:.3f}%\n"
-    msg += f"• 청산 기준 펀딩비: {EXIT_FUNDING_RATE * 100:.3f}%\n"
+    msg += f"• 진입 기준 펀딩비: {MIN_FUNDING_RATE * 100:.4f}%\n"
+    msg += f"• 청산 기준 펀딩비: {EXIT_FUNDING_RATE * 100:.4f}%\n"
     msg += f"• 입금 원금 자산: ${INITIAL_DEPOSIT_USDT:.2f} USDT (약 {INITIAL_DEPOSIT_USDT * krw_rate:,.0f}원)\n"
     msg += f"• 현재 통합 총자산: ${total_eq_usdt:.2f} USDT (약 {total_krw:,.0f}원)\n"
     msg += f"• 실시간 누적 손익: ${pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}% / {pnl_krw:+,.0f}원)\n"
@@ -287,215 +432,136 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def setlev_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/setlev [배수] 명령어 (예: /setlev 3)"""
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
-
     global TARGET_LEVERAGE
-
     if not context.args:
-        await update.message.reply_text(
-            f"ℹ️ **현재 레버리지**: {TARGET_LEVERAGE}배\n"
-            "⚠️ **사용법**: `/setlev 3` (숫자로 변경할 배수 입력)"
-        )
+        await update.message.reply_text(f"ℹ️ **현재 레버리지**: {TARGET_LEVERAGE}배\n⚠️ **사용법**: `/setlev 3`")
         return
-
     try:
         new_lev = int(context.args[0])
         if new_lev < 1 or new_lev > 10:
-            await update.message.reply_text("❌ 레버리지는 1배 이상 10배 이하로만 설정 가능합니다.")
+            await update.message.reply_text("❌ 레버리지는 1배~10배만 설정 가능합니다.")
             return
-
-        pos = await asyncio.to_thread(get_positions)
-        if pos:
-            await update.message.reply_text("⚠️ 주의: 현재 포지션이 열려 있는 상태에서 레버리지를 변경합니다.")
-
-        # OKX 거래소 레버리지 변경 적용
         await asyncio.to_thread(setup_exchange_account_mode, SYMBOL_SWAP, new_lev)
         TARGET_LEVERAGE = new_lev
-
         await update.message.reply_text(f"✅ **선물 레버리지가 {TARGET_LEVERAGE}배로 설정되었습니다.**")
-        logging.info(f"텔레그램 명령어 레버리지 변경: {TARGET_LEVERAGE}배")
-
-    except ValueError:
-        await update.message.reply_text("❌ 수치를 정수로 입력해주세요. (예: `/setlev 3`)")
     except Exception as e:
-        await update.message.reply_text(f"❌ 레버리지 변경 실패: {e}")
+        await update.message.reply_text(f"❌ 설정 실패: {e}")
 
 async def setfund_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/setfund 명령어"""
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
-
     global MIN_FUNDING_RATE, EXIT_FUNDING_RATE
-
     if len(context.args) < 1:
-        await update.message.reply_text(
-            "⚠️ **펀딩비 변경 사용법**:\n"
-            "• `/setfund 0.025` (진입 펀딩비를 0.025%로 변경)\n"
-            "• `/setfund 0.025 0.005` (진입 0.025%, 청산 0.005%로 변경)"
-        )
+        await update.message.reply_text("⚠️ **사용법**: `/setfund 0.025` 또는 `/setfund 0.025 0.005`")
         return
-
     try:
         new_min = float(context.args[0]) / 100.0
         new_exit = float(context.args[1]) / 100.0 if len(context.args) >= 2 else EXIT_FUNDING_RATE
 
+        if new_min <= ABSOLUTE_MIN_FUNDING:
+            await update.message.reply_text("⚠️ 경고: 진입 펀딩비가 0.01% 이하일 경우 강제 하한 0.01%가 적용됩니다.")
+            new_min = ABSOLUTE_MIN_FUNDING
+
         MIN_FUNDING_RATE = new_min
         EXIT_FUNDING_RATE = new_exit
-
-        msg = f"🎯 **펀딩비 기준이 성공적으로 변경되었습니다!**\n\n"
-        msg += f"• 진입 기준 펀딩비: {MIN_FUNDING_RATE * 100:.3f}%\n"
-        msg += f"• 청산 기준 펀딩비: {EXIT_FUNDING_RATE * 100:.3f}%"
-        await update.message.reply_text(msg)
-        logging.info(f"펀딩비 변경: 진입={MIN_FUNDING_RATE*100:.3f}%, 청산={EXIT_FUNDING_RATE*100:.3f}%")
-
+        await update.message.reply_text(
+            f"🎯 **펀딩비 변경 완료**\n진입: {MIN_FUNDING_RATE * 100:.4f}%\n청산: {EXIT_FUNDING_RATE * 100:.4f}%"
+        )
     except Exception as e:
-        await update.message.reply_text(f"❌ 설정 실패: 수치를 확인해주세요 (예: `/setfund 0.025`)\n오류: {e}")
+        await update.message.reply_text(f"❌ 설정 실패: {e}")
 
 async def profit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/profit 명령어"""
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
-
     usdt_free, total_eq_usdt, coin_total, spot_val_krw = await asyncio.to_thread(get_balance)
     krw_rate = await asyncio.to_thread(get_usdt_krw_rate)
-
     pnl_usdt = total_eq_usdt - INITIAL_DEPOSIT_USDT
     pnl_pct = (pnl_usdt / INITIAL_DEPOSIT_USDT) * 100 if INITIAL_DEPOSIT_USDT > 0 else 0.0
     
-    deposit_krw = INITIAL_DEPOSIT_USDT * krw_rate
-    total_krw = total_eq_usdt * krw_rate
-    pnl_krw = pnl_usdt * krw_rate
-
-    msg = f"💰 [수익 및 자산 현황 보고]\n\n"
-    msg += f"• 입금 원금 자산: ${INITIAL_DEPOSIT_USDT:.2f} USDT (약 {deposit_krw:,.0f}원)\n"
-    msg += f"• 현재 통합 총자산: ${total_eq_usdt:.2f} USDT (약 {total_krw:,.0f}원)\n"
-    msg += f"• 실시간 누적 손익: ${pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}% / {pnl_krw:+,.0f}원)\n"
-    msg += f"• 현물({TARGET_COIN}) 평가금: {coin_total:.3f} {TARGET_COIN} (약 {spot_val_krw:,.0f}원)\n"
-    msg += f"• 가용 가능 잔고: ${usdt_free:.2f} USDT\n"
-    msg += f"• 적용 환율: 1 USDT = {krw_rate:,.1f}원"
-
+    msg = f"💰 [수익 현황]\n"
+    msg += f"• 원금: ${INITIAL_DEPOSIT_USDT:.2f} USDT\n"
+    msg += f"• 총자산: ${total_eq_usdt:.2f} USDT (약 {total_eq_usdt * krw_rate:,.0f}원)\n"
+    msg += f"• 손익: ${pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}%)\n"
+    msg += f"• 가용 잔고: ${usdt_free:.2f} USDT"
     await update.message.reply_text(msg)
 
 async def setcoin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/setcoin [심볼] 명령어"""
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
-
     if not context.args:
-        await update.message.reply_text("⚠️ 사용법: `/setcoin DOGE` 형태로 입력하세요.")
+        await update.message.reply_text("⚠️ 사용법: `/setcoin SUI`")
         return
-
     new_coin = context.args[0].upper()
-
     pos = await asyncio.to_thread(get_positions)
     if pos:
-        await update.message.reply_text(f"❌ 실패: 현재 {TARGET_COIN} 포지션이 열려있습니다. 먼저 /close 명령어로 청산하세요.")
+        await update.message.reply_text("❌ 포지션 열림 상태에서는 변경 불가합니다.")
         return
-
-    has_orders = await asyncio.to_thread(has_open_orders)
-    if has_orders:
-        await update.message.reply_text("❌ 실패: 미체결 주문이 남아있습니다.")
-        return
-
-    await update.message.reply_text(f"⏳ OKX에서 {new_coin} 마켓 스펙 설정 중...")
-
     try:
         await asyncio.to_thread(update_coin_spec, new_coin)
-        spot_price, swap_price = await asyncio.to_thread(get_ticker_prices)
-
-        reply_msg = f"✅ **매매 대상 코인이 {TARGET_COIN}으로 변경되었습니다!**\n\n"
-        reply_msg += f"• 현물: `{SYMBOL_SPOT}` | 선물: `{SYMBOL_SWAP}`\n"
-        reply_msg += f"• 설정 레버리지: {TARGET_LEVERAGE}배\n"
-        reply_msg += f"• 현재가: 현물 ${spot_price:.4f} / 선물 ${swap_price:.4f}"
-
-        await update.message.reply_text(reply_msg)
+        await update.message.reply_text(f"✅ 코인이 **{TARGET_COIN}**으로 수동 변경되었습니다.")
     except Exception as e:
-        await update.message.reply_text(f"⚠️ 코인 변경 실패: {str(e)}")
+        await update.message.reply_text(f"❌ 코인 변경 실패: {e}")
 
 async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/close 수동 청산 명령어"""
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
-
-    pos = await asyncio.to_thread(get_positions)
-    _, _, coin_total, _ = await asyncio.to_thread(get_balance)
-    if not pos and coin_total <= 0:
-        await update.message.reply_text("ℹ️ 현재 청산할 포지션이 없습니다.")
-        return
-
-    await update.message.reply_text("⏳ 수동 청산을 시작합니다...")
-    success = await asyncio.to_thread(execute_delta_neutral_exit, "관리자 수동 요청 (/close)")
-    
-    if success:
-        await update.message.reply_text("✅ 수동 청산이 완료되었습니다.")
-    else:
-        await update.message.reply_text("❌ 청산 도중 오류가 발생했습니다.")
+    await update.message.reply_text("⏳ 수동 청산 시작...")
+    success = await execute_delta_neutral_exit_async("관리자 수동 요청 (/close)")
+    await update.message.reply_text("✅ 수동 청산 완료!" if success else "❌ 청산 실패")
 
 async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/switch 스위치 변경 명령어"""
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
-
     global BOT_SWITCH
     BOT_SWITCH = not BOT_SWITCH
-    status_str = "🟢 ON (가동)" if BOT_SWITCH else "🔴 OFF (일시 정지)"
-    await update.message.reply_text(f"🔄 봇 매매 스위치가 {status_str} 상태로 변경되었습니다.")
+    await update.message.reply_text(f"🔄 스위치: {'🟢 ON' if BOT_SWITCH else '🔴 OFF'}")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/start 명령어 (일시정지 후 재개)"""
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
-
     global BOT_SWITCH
     BOT_SWITCH = True
-    await update.message.reply_text(f"▶️ **봇 동작을 시작/재개합니다.** (현재 타겟: {TARGET_COIN})")
-    logging.info(f"텔레그램 명령어 봇 재개 (/start) - 대상: {TARGET_COIN}")
+    await update.message.reply_text(f"▶️ **봇 매매 재개** (타겟: {TARGET_COIN})")
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/restart 명령"""
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
-    await update.message.reply_text("🔄 봇 프로세스를 재시작합니다...")
+    await update.message.reply_text("🔄 재시작 중...")
     os.execv(sys.executable, ['python3'] + sys.argv)
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/stop 명령 (프로세스 종료 대신 일시 정지)"""
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
     global BOT_SWITCH
     BOT_SWITCH = False
-    await update.message.reply_text("⏸️ **봇 매매를 일시 정지합니다.**\n(텔레그램 명령어 수신은 계속 유지되며, `/start`로 재개할 수 있습니다.)")
-    logging.info("텔레그램 명령어 봇 일시 정지 (/stop)")
+    await update.message.reply_text("⏸️ **봇 매매 일시 정지**")
 
 async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/kill 명령 (프로세스 완전 종료)"""
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
-    await update.message.reply_text("💀 **봇 프로세스를 완전히 종료합니다.**")
-    logging.info("텔레그램 명령어 봇 완전 종료 (/kill)")
+    await update.message.reply_text("💀 **프로세스 종료**")
     os._exit(0)
 
 # ==========================================
-# 6. 정밀 주문 및 청산 집행 함수
+# 7. 🔥 초고속 주문 및 청산 집행 (나노초 벤치마킹 적용)
 # ==========================================
-def execute_delta_neutral_entry():
-    """가용 잔고 95% 기반 정밀 진입"""
+async def execute_delta_neutral_entry_async():
+    """가용 잔고 95% 기반 나노초 측정 초고속 진입"""
     global POSITION_BASE_USDT
     
-    usdt_free, total_eq, _, _ = get_balance()
+    usdt_free, total_eq, _ = await get_balance_async()
     available_usdt = usdt_free * 0.95
 
     if available_usdt < 10.0:
-        logging.warning("⚠️ 주문 가능한 USDT 잔고가 부족합니다 (최소 10 USDT 필요).")
+        logging.warning("⚠️ 가용 USDT 잔고 부족 (최소 10 USDT 필요)")
         return False
 
-    spot_price, swap_price = get_ticker_prices()
+    spot_price, swap_price = await get_ticker_prices_async()
     if spot_price <= 0 or swap_price <= 0:
         return False
 
-    # 레버리지를 고려한 계약당 실제 필요 증거금 계산
     cost_per_contract = (swap_price * COIN_SPEC['ctVal']) / TARGET_LEVERAGE
     max_contracts = math.floor(available_usdt / cost_per_contract)
     swap_contracts = truncate_value(float(max_contracts), COIN_SPEC['swap_amount_prec'])
@@ -506,161 +572,151 @@ def execute_delta_neutral_entry():
         return False
 
     try:
-        logging.info(f"🚀 [주문 시도] 선물 숏({TARGET_LEVERAGE}x): {swap_contracts} 계약 | 현물 매수: {spot_amount} {TARGET_COIN}")
+        t_start_ns = time.perf_counter_ns() # 나노초 타임스탬프
+        logging.info(f"🚀 [초고속 진입 시작] {TARGET_COIN} 선물 숏: {swap_contracts} Cont | 현물 매수: {spot_amount}")
 
-        okx.create_order(
-            symbol=SYMBOL_SWAP,
-            type='market',
-            side='sell',
-            amount=swap_contracts,
-            params={'tdMode': 'cross'}
+        # 병렬 비동기 주문 발송 (속도 최우선)
+        swap_order_task = async_okx.create_order(
+            symbol=SYMBOL_SWAP, type='market', side='sell', amount=swap_contracts, params={'tdMode': 'cross'}
         )
-        logging.info(f"✅ 선물 숏 체결 성공: {swap_contracts} 계약")
+        spot_order_task = async_okx.create_order(
+            symbol=SYMBOL_SPOT, type='market', side='buy', amount=spot_amount, params={'tdMode': 'cross', 'tgtCcy': 'base_ccy'}
+        )
 
-        try:
-            okx.create_order(
-                symbol=SYMBOL_SPOT,
-                type='market',
-                side='buy',
-                amount=spot_amount,
-                params={'tdMode': 'cross', 'tgtCcy': 'base_ccy'}
-            )
-            logging.info(f"✅ 현물 매수 체결 성공: {spot_amount} {TARGET_COIN}")
-            POSITION_BASE_USDT = total_eq
-            return True
+        results = await asyncio.gather(swap_order_task, spot_order_task, return_exceptions=True)
+        t_end_ns = time.perf_counter_ns()
+        
+        elapsed_ms = (t_end_ns - t_start_ns) / 1_000_000.0
+        logging.info(f"⚡ 주문 처리 완료 시간: {elapsed_ms:.3f} ms (나노초: {t_end_ns - t_start_ns} ns)")
 
-        except Exception as spot_err:
-            logging.error(f"❌ 현물 매수 실패! 선물 숏 포지션 롤백 시도: {spot_err}")
-            okx.create_order(
-                symbol=SYMBOL_SWAP,
-                type='market',
-                side='buy',
-                amount=swap_contracts,
-                params={'reduceOnly': True, 'tdMode': 'cross'}
-            )
-            time.sleep(30)
+        if isinstance(results[0], Exception) or isinstance(results[1], Exception):
+            logging.error(f"❌ 동시 주문 체결 중 일부 에러 발생: {results}")
+            await execute_delta_neutral_exit_async("비상 롤백 청산")
             return False
 
+        POSITION_BASE_USDT = total_eq
+        return True
+
     except Exception as e:
-        logging.error(f"❌ 주문 집행 중 에러 발생: {e}")
+        logging.error(f"❌ 주문 집행 에러: {e}")
         return False
 
-def execute_delta_neutral_exit(reason: str = "펀딩비 청산 조건 도달") -> bool:
-    """델타 뉴트럴 포지션 전량 청산"""
+async def execute_delta_neutral_exit_async(reason: str = "펀딩비 청산") -> bool:
+    """델타 뉴트럴 포지션 비동기 초고속 청산"""
     global POSITION_BASE_USDT
     try:
-        cancel_all_open_orders()
+        t_start_ns = time.perf_counter_ns()
+        await asyncio.to_thread(cancel_all_open_orders)
         
-        pos = get_positions()
-        _, _, coin_total, _ = get_balance()
+        pos = await get_positions_async()
+        _, _, coin_total = await get_balance_async()
 
         if not pos and coin_total <= 0:
             return True
 
-        logging.info(f"🚨 [포지션 청산 시작] 사유: {reason}")
+        logging.info(f"🚨 [포지션 청산] 사유: {reason}")
 
+        tasks = []
         if pos:
             contracts = float(pos.get('contracts', 0))
             if contracts > 0:
-                okx.create_order(
-                    symbol=SYMBOL_SWAP,
-                    type='market',
-                    side='buy',
-                    amount=contracts,
-                    params={'reduceOnly': True, 'tdMode': 'cross'}
-                )
+                tasks.append(async_okx.create_order(
+                    symbol=SYMBOL_SWAP, type='market', side='buy', amount=contracts, params={'reduceOnly': True, 'tdMode': 'cross'}
+                ))
 
         spot_amount_to_sell = truncate_value(coin_total, COIN_SPEC['spot_amount_prec'])
         if spot_amount_to_sell >= COIN_SPEC['spot_min_amount']:
-            okx.create_order(
-                symbol=SYMBOL_SPOT,
-                type='market',
-                side='sell',
-                amount=spot_amount_to_sell,
-                params={'tdMode': 'cross', 'tgtCcy': 'base_ccy'}
-            )
+            tasks.append(async_okx.create_order(
+                symbol=SYMBOL_SPOT, type='market', side='sell', amount=spot_amount_to_sell, params={'tdMode': 'cross', 'tgtCcy': 'base_ccy'}
+            ))
 
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        t_elapsed_ms = (time.perf_counter_ns() - t_start_ns) / 1_000_000.0
         POSITION_BASE_USDT = 0.0
-        logging.info("🎉 델타 뉴트럴 전량 청산 완료!")
+        logging.info(f"🎉 초고속 전량 청산 완료! (소요시간: {t_elapsed_ms:.3f} ms)")
         return True
 
     except Exception as e:
-        logging.error(f"❌ 청산 집행 중 에러 발생: {e}")
+        logging.error(f"❌ 청산 에러: {e}")
         return False
 
 # ==========================================
-# 7. 핵심 매매 로직 주기 실행 함수
+# 8. 🔥 매매 주기 비동기 실행 루프
 # ==========================================
-def trade_logic_cycle():
-    """매 10초마다 매매 조건 체크"""
+async def trade_logic_cycle_async():
+    """매 2초마다 초고속 매매 조건 체크"""
     if not BOT_SWITCH:
         return
 
-    spot_price, swap_price = get_ticker_prices()
-    funding_rate = get_funding_rate()
-    pos = get_positions()
+    spot_price, swap_price = await get_ticker_prices_async()
+    funding_rate = await get_funding_rate_async()
+    pos = await get_positions_async()
 
     logging.info(
         f"[{TARGET_COIN} 감시 중] 레버리지: {TARGET_LEVERAGE}x | 현물: ${spot_price:.4f} | 선물: ${swap_price:.4f} | "
-        f"현재 펀딩비: {funding_rate*100:.4f}% (목표: {MIN_FUNDING_RATE*100:.3f}%) | "
+        f"현재 펀딩비: {funding_rate*100:.4f}% (목표: {MIN_FUNDING_RATE*100:.4f}%) | "
         f"포지션: {'보유' if pos else '미보유'}"
     )
 
-    if not pos and funding_rate >= MIN_FUNDING_RATE:
-        logging.info(f"🚀 {TARGET_COIN} 진입 조건 충족! (펀딩비: {funding_rate*100:.4f}%)")
-        execute_delta_neutral_entry()
+    # 🚨 [조건] 포지션 미보유 + 펀딩비가 목표(95%) 이상 + 절댓값 0.01% 초과 시 진입
+    if not pos and funding_rate >= MIN_FUNDING_RATE and funding_rate > ABSOLUTE_MIN_FUNDING:
+        logging.info(f"🚀 {TARGET_COIN} 진입 조건 충족! (현재 펀딩비: {funding_rate*100:.4f}%)")
+        await execute_delta_neutral_entry_async()
 
     elif pos and funding_rate <= EXIT_FUNDING_RATE:
-        logging.info(f"📉 {TARGET_COIN} 청산 조건 충족! (현재 펀딩비: {funding_rate*100:.4f}% <= 목표: {EXIT_FUNDING_RATE*100:.3f}%)")
-        execute_delta_neutral_exit("펀딩비 하락 청산")
+        logging.info(f"📉 {TARGET_COIN} 청산 조건 충족! (현재: {funding_rate*100:.4f}% <= 목표: {EXIT_FUNDING_RATE*100:.4f}%)")
+        await execute_delta_neutral_exit_async("펀딩비 하락 청산")
 
 # ==========================================
-# 8. 비동기 30분 정기 로그 알림 (레버리지 정보 포함)
+# 9. 30분 정기 알림 & 비동기 백그라운드 루프
 # ==========================================
 async def periodic_log_reporter(app: Application):
-    """30분마다 전체 자산/원화환율/가치 반영 텔레그램 리포트"""
+    """30분 정기 상태 보고"""
     while True:
         try:
             await asyncio.sleep(1800)
-            
-            spot_price, swap_price = await asyncio.to_thread(get_ticker_prices)
-            funding_rate = (await asyncio.to_thread(get_funding_rate)) * 100
-            _, total_eq_usdt, coin_total, spot_val_krw = await asyncio.to_thread(get_balance)
-            pos = await asyncio.to_thread(get_positions)
+            spot_price, swap_price = await get_ticker_prices_async()
+            funding_rate = (await get_funding_rate_async()) * 100
+            _, total_eq_usdt, coin_total = await get_balance_async()
+            pos = await get_positions_async()
             krw_rate = await asyncio.to_thread(get_usdt_krw_rate)
 
             pnl_usdt = total_eq_usdt - INITIAL_DEPOSIT_USDT
             pnl_pct = (pnl_usdt / INITIAL_DEPOSIT_USDT) * 100 if INITIAL_DEPOSIT_USDT > 0 else 0.0
-            
-            deposit_krw = INITIAL_DEPOSIT_USDT * krw_rate
-            total_krw = total_eq_usdt * krw_rate
-            pnl_krw = pnl_usdt * krw_rate
 
             log_msg = f"⏰ [30분 정기 상태 알림 - {TARGET_COIN}]\n\n"
-            log_msg += f"• 입금 원금 자산: ${INITIAL_DEPOSIT_USDT:.2f} USDT (약 {deposit_krw:,.0f}원)\n"
-            log_msg += f"• 현재 통합 총자산: ${total_eq_usdt:.2f} USDT (약 {total_krw:,.0f}원)\n"
-            log_msg += f"• 실시간 누적 손익: ${pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}% / {pnl_krw:+,.0f}원)\n"
-            log_msg += f"• 보유 현물({TARGET_COIN}): {coin_total:.3f} 개 (약 {spot_val_krw:,.0f}원)\n"
-            log_msg += f"• 현물/선물 가격: ${spot_price:.4f} / ${swap_price:.4f}\n"
-            log_msg += f"• 설정 레버리지: {TARGET_LEVERAGE}배\n"
-            log_msg += f"• 현재 펀딩비: {funding_rate:.4f}% (진입기준: {MIN_FUNDING_RATE*100:.3f}%)\n"
-            log_msg += f"• 포지션 상태: {'보유 중 (숏)' if pos else '미보유 (관망 중)'}\n"
-            log_msg += f"• 스위치 상태: {'🟢 ON' if BOT_SWITCH else '🔴 OFF'}"
+            log_msg += f"• 현재 통합 총자산: ${total_eq_usdt:.2f} USDT (약 {total_eq_usdt * krw_rate:,.0f}원)\n"
+            log_msg += f"• 누적 손익: ${pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}%)\n"
+            log_msg += f"• 보유 현물: {coin_total:.3f} {TARGET_COIN}\n"
+            log_msg += f"• 현재가: 현물 ${spot_price:.4f} / 선물 ${swap_price:.4f}\n"
+            log_msg += f"• 실시간 펀딩비: {funding_rate:.4f}% (진입기준: {MIN_FUNDING_RATE*100:.4f}%)\n"
+            log_msg += f"• 포지션 상태: {'보유 중' if pos else '관망 중'}\n"
 
             await send_telegram_msg_async(app, log_msg)
-            logging.info("📢 30분 정기 텔레그램 로그 전송 완료")
         except Exception as e:
-            logging.error(f"30분 정기 로그 전송 에러: {e}")
+            logging.error(f"정기 리포트 에러: {e}")
+
+async def auto_scanner_task():
+    """포지션 미보유 시 30초마다 거래량 & 펀딩비 우량 코인 자동 탐색"""
+    while True:
+        try:
+            if BOT_SWITCH:
+                await find_best_funding_coin(min_volume_usdt=10000000.0)
+        except Exception as e:
+            logging.error(f"자동 스캐너 에러: {e}")
+        await asyncio.sleep(30)
 
 # ==========================================
-# 9. 비동기 메인 이벤트 루프
+# 10. 비동기 메인 이벤트 루프
 # ==========================================
 async def main():
     try:
         await asyncio.to_thread(update_coin_spec, TARGET_COIN)
-        logging.info(f"기본 코인 스펙 설정 완료: {TARGET_COIN} (레버리지 {TARGET_LEVERAGE}배)")
+        logging.info(f"초기 코인 스펙 설정 완료: {TARGET_COIN} ({TARGET_LEVERAGE}배)")
     except Exception as e:
-        logging.error(f"초기 스펙 설정 에러: {e}")
+        logging.error(f"초기 설정 에러: {e}")
 
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     application = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
@@ -681,33 +737,36 @@ async def main():
     await application.start()
     await application.updater.start_polling()
 
-    logging.info(f"🤖 델타 뉴트럴 자동 매매 봇 시작 (원금: ${INITIAL_DEPOSIT_USDT} USDT)")
+    logging.info(f"🤖 초고속 차익거래 봇 가동 시작 (원금: ${INITIAL_DEPOSIT_USDT} USDT)")
     
     krw_rate = await asyncio.to_thread(get_usdt_krw_rate)
     await send_telegram_msg_async(
         application, 
-        f"🤖 **델타 뉴트럴 자동 매매 봇이 업데이트 되었습니다.**\n\n"
+        f"🤖 **자동 종목 탐색 & 초고속 차익거래 봇 가동!**\n\n"
         f"• 기본 타겟: {TARGET_COIN}\n"
         f"• 설정 레버리지: {TARGET_LEVERAGE}배\n"
-        f"• 입금 원금 설정: ${INITIAL_DEPOSIT_USDT:.2f} USDT (약 {INITIAL_DEPOSIT_USDT * krw_rate:,.0f}원)\n"
-        f"• 진입 펀딩비: {MIN_FUNDING_RATE*100:.3f}%\n"
-        f"• 청산 펀딩비: {EXIT_FUNDING_RATE*100:.3f}%"
+        f"• 최소 진입 펀딩비 안전선: 0.0100%\n"
+        f"• 자동 스위칭: 거래량 $1,000만 이상 상위 펀딩비 코인 추적"
     )
 
+    # 백그라운드 비동기 루프 생성
     asyncio.create_task(periodic_log_reporter(application))
+    asyncio.create_task(auto_scanner_task())
 
     try:
         while True:
             try:
-                await asyncio.to_thread(trade_logic_cycle)
+                await trade_logic_cycle_async()
             except Exception as e:
                 logging.error(f"매매 루프 오류: {e}")
 
-            await asyncio.sleep(10)
+            # 초고속 2초 주기 체크
+            await asyncio.sleep(2)
             
     except (KeyboardInterrupt, SystemExit):
         logging.info("봇 종료 요청을 받았습니다.")
     finally:
+        await async_okx.close()
         await application.updater.stop()
         await application.stop()
         await application.shutdown()
