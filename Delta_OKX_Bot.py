@@ -37,9 +37,10 @@ TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID")
 INITIAL_DEPOSIT_USDT = float(os.getenv("INITIAL_DEPOSIT_USDT", 145.00))
 
 # 🎯 펀딩비 및 안전 하한선 설정
-MIN_FUNDING_RATE = 0.0001    # 실시간 동적 설정 (기본값)
-EXIT_FUNDING_RATE = 0.00005   # 청산 하한선 (기본 0.005%)
-ABSOLUTE_MIN_FUNDING = 0.0001 # 🚨 절댓값 하한선 0.01% (이하는 절대 진입 금지)
+ABSOLUTE_MIN_FUNDING = 0.0001 # 🚨 하한선 0.01% (이하는 절대 진입 금지)
+MIN_FUNDING_RATE = 0.0001     # 기본 진입 기준 (0.01%)
+EXIT_FUNDING_RATE = 0.00005   # 청산 하한선 (0.005%)
+MIN_VOLUME_USDT = 5000000.0   # 기본 최소 거래대금 ($5,000,000)
 
 # 로깅 설정
 logging.basicConfig(
@@ -311,13 +312,12 @@ def get_funding_rate():
 # ==========================================
 # 5. 🔥 거래대금 & 펀딩비 복합 자동 탐색 (나노초 스피드 스캔)
 # ==========================================
-async def find_best_funding_coin(min_volume_usdt: float = 10000000.0):
+async def find_best_funding_coin():
     """
-    거래대금과 펀딩비의 복합 가중치를 계산하여 최우선 순위 코인 탐색.
-    0.01% (0.0001) 초과 종목 중 거래대금과 펀딩비가 높은 최적 코인 선택.
-    실시간 펀딩비의 95% 선을 진입 기준으로 자동 설정.
+    설정된 최소 거래대금 이상 종목 중 펀딩비가 높은 순으로 우량 코인 탐색.
+    0.01% (0.0001) 초과 종목 중에서 우선 순위를 매겨 선택함.
     """
-    global MIN_FUNDING_RATE, EXIT_FUNDING_RATE, TARGET_COIN
+    global TARGET_COIN, MIN_VOLUME_USDT
     try:
         t_start_ns = time.perf_counter_ns()
         
@@ -331,7 +331,7 @@ async def find_best_funding_coin(min_volume_usdt: float = 10000000.0):
         for symbol, ticker in tickers.items():
             if symbol.endswith(':USDT') and '/USDT' in symbol:
                 quote_volume = float(ticker.get('quoteVolume', 0.0) or 0.0)
-                if quote_volume >= min_volume_usdt:
+                if quote_volume >= MIN_VOLUME_USDT:
                     candidate_symbols.append((symbol, symbol.split('/')[0], quote_volume))
 
         if not candidate_symbols:
@@ -343,24 +343,20 @@ async def find_best_funding_coin(min_volume_usdt: float = 10000000.0):
 
         best_coin = None
         best_funding = -999.0
-        best_score = -999.0
 
         for (sym, coin, volume), result in zip(candidate_symbols, funding_results):
             if isinstance(result, dict) and 'fundingRate' in result:
                 rate = float(result.get('fundingRate', 0.0) or 0.0)
                 
-                # 🚨 [하한선 조건] 실시간 펀딩비가 0.01% (0.0001) 이하일 경우 무조건 제외
+                # 🚨 [진입 하한선 조건] 실시간 펀딩비가 0.01% (0.0001) 이하일 경우 무조건 제외
                 if rate > ABSOLUTE_MIN_FUNDING:
-                    # 복합 점수 계산: (펀딩비 * 10,000) * log10(거래대금)
-                    score = (rate * 10000.0) * math.log10(volume)
-                    if score > best_score:
-                        best_score = score
-                        best_coin = coin
+                    if rate > best_funding:
                         best_funding = rate
+                        best_coin = coin
 
         t_scan_ms = (time.perf_counter_ns() - t_start_ns) / 1_000_000.0
 
-        # 조건 충족하는 최우선 순위 코인 반영
+        # 조건 충족하는 가장 높은 펀딩비 코인 반영
         if best_coin and best_funding > ABSOLUTE_MIN_FUNDING:
             if best_coin != TARGET_COIN:
                 logging.info(
@@ -368,18 +364,6 @@ async def find_best_funding_coin(min_volume_usdt: float = 10000000.0):
                     f"(실시간 펀딩비: {best_funding*100:.4f}%, 스캔소요: {t_scan_ms:.2f}ms)"
                 )
                 await asyncio.to_thread(update_coin_spec, best_coin)
-
-            # 💡 [핵심] 진입 기준 = 해당 코인 실시간 펀딩비의 95%
-            calculated_entry_rate = best_funding * 0.95
-            
-            # 0.01% 이하로 떨어지지 않도록 안전 하한선 적용
-            MIN_FUNDING_RATE = max(calculated_entry_rate, ABSOLUTE_MIN_FUNDING)
-            EXIT_FUNDING_RATE = max(MIN_FUNDING_RATE * 0.2, 0.00005)
-
-            logging.info(
-                f"🎯 [{TARGET_COIN} 세팅 완료] 실시간: {best_funding*100:.4f}% | "
-                f"진입기준(95%): {MIN_FUNDING_RATE*100:.4f}% | 청산기준: {EXIT_FUNDING_RATE*100:.4f}%"
-            )
 
     except Exception as e:
         logging.error(f"최적 코인 탐색 에러: {e}")
@@ -407,7 +391,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"📊 [봇 현재 상태 보고 - {TARGET_COIN}]\n\n"
     msg += f"• 스위치 상태: {switch_str}\n"
     msg += f"• 설정 레버리지: {TARGET_LEVERAGE}배\n"
-    msg += f"• 진입 기준 펀딩비: {MIN_FUNDING_RATE * 100:.4f}%\n"
+    msg += f"• 검색 기준 거래대금: ${MIN_VOLUME_USDT:,.0f} USDT\n"
+    msg += f"• 최소 진입 펀딩비: {MIN_FUNDING_RATE * 100:.4f}%\n"
     msg += f"• 청산 기준 펀딩비: {EXIT_FUNDING_RATE * 100:.4f}%\n"
     msg += f"• 입금 원금 자산: ${INITIAL_DEPOSIT_USDT:.2f} USDT (약 {INITIAL_DEPOSIT_USDT * krw_rate:,.0f}원)\n"
     msg += f"• 현재 통합 총자산: ${total_eq_usdt:.2f} USDT (약 {total_krw:,.0f}원)\n"
@@ -430,6 +415,26 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"📦 현재 보유 중인 포지션이 없습니다 (관망 중)."
 
     await update.message.reply_text(msg)
+
+async def setvol_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """최소 거래대금 조건 텔레그램 실시간 설정"""
+    if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
+        return
+    global MIN_VOLUME_USDT
+    if not context.args:
+        await update.message.reply_text(
+            f"ℹ️ **현재 탐색 거래대금 기준**: ${MIN_VOLUME_USDT:,.0f} USDT\n⚠️ **사용법**: `/setvol 5000000` (500만불)"
+        )
+        return
+    try:
+        new_vol = float(context.args[0])
+        if new_vol < 100000:
+            await update.message.reply_text("❌ 최소 거래대금은 $100,000 이상이어야 합니다.")
+            return
+        MIN_VOLUME_USDT = new_vol
+        await update.message.reply_text(f"✅ **탐색 거래대금 기준이 ${MIN_VOLUME_USDT:,.0f} USDT로 변경되었습니다.**")
+    except Exception as e:
+        await update.message.reply_text(f"❌ 설정 실패: {e}")
 
 async def setlev_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
@@ -454,13 +459,13 @@ async def setfund_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     global MIN_FUNDING_RATE, EXIT_FUNDING_RATE
     if len(context.args) < 1:
-        await update.message.reply_text("⚠️ **사용법**: `/setfund 0.025` 또는 `/setfund 0.025 0.005`")
+        await update.message.reply_text("⚠️ **사용법**: `/setfund 0.025` 또는 `/setfund 0.025 0.005` (단위: %)")
         return
     try:
         new_min = float(context.args[0]) / 100.0
         new_exit = float(context.args[1]) / 100.0 if len(context.args) >= 2 else EXIT_FUNDING_RATE
 
-        if new_min <= ABSOLUTE_MIN_FUNDING:
+        if new_min < ABSOLUTE_MIN_FUNDING:
             await update.message.reply_text("⚠️ 경고: 진입 펀딩비가 0.01% 이하일 경우 강제 하한 0.01%가 적용됩니다.")
             new_min = ABSOLUTE_MIN_FUNDING
 
@@ -660,7 +665,7 @@ async def trade_logic_cycle_async():
         f"포지션: {'보유' if pos else '미보유'}"
     )
 
-    # 🚨 [조건] 포지션 미보유 + 펀딩비가 목표(95%) 이상 + 절댓값 0.01% 초과 시 진입
+    # 🚨 [조건] 포지션 미보유 + 펀딩비가 목표 이상 + 0.01% (0.0001) 초과 시 진입
     if not pos and funding_rate >= MIN_FUNDING_RATE and funding_rate > ABSOLUTE_MIN_FUNDING:
         logging.info(f"🚀 {TARGET_COIN} 진입 조건 충족! (현재 펀딩비: {funding_rate*100:.4f}%)")
         await execute_delta_neutral_entry_async()
@@ -699,11 +704,11 @@ async def periodic_log_reporter(app: Application):
             logging.error(f"정기 리포트 에러: {e}")
 
 async def auto_scanner_task():
-    """포지션 미보유 시 30초마다 거래량 & 펀딩비 우량 코인 자동 탐색"""
+    """포지션 미보유 시 30초마다 최소 거래대금 이상 펀딩비 우량 코인 자동 탐색"""
     while True:
         try:
             if BOT_SWITCH:
-                await find_best_funding_coin(min_volume_usdt=10000000.0)
+                await find_best_funding_coin()
         except Exception as e:
             logging.error(f"자동 스캐너 에러: {e}")
         await asyncio.sleep(30)
@@ -724,6 +729,7 @@ async def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("profit", profit_command))
+    application.add_handler(CommandHandler("setvol", setvol_command)) # 거래대금 변경 핸들러 추가
     application.add_handler(CommandHandler("setfund", setfund_command))
     application.add_handler(CommandHandler("setcoin", setcoin_command))
     application.add_handler(CommandHandler("setlev", setlev_command))
@@ -745,8 +751,9 @@ async def main():
         f"🤖 **자동 종목 탐색 & 초고속 차익거래 봇 가동!**\n\n"
         f"• 기본 타겟: {TARGET_COIN}\n"
         f"• 설정 레버리지: {TARGET_LEVERAGE}배\n"
+        f"• 탐색 거래대금 하한: ${MIN_VOLUME_USDT:,.0f} USDT\n"
         f"• 최소 진입 펀딩비 안전선: 0.0100%\n"
-        f"• 자동 스위칭: 거래량 $1,000만 이상 상위 펀딩비 코인 추적"
+        f"• 자동 스위칭: 거래량 조건 충족 상위 펀딩비 코인 추적"
     )
 
     # 백그라운드 비동기 루프 생성
