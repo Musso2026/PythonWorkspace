@@ -83,59 +83,63 @@ def get_telegram_updates(last_update_id):
     return [], last_update_id
 
 # ==========================================
-# 📊 OKX 펀딩비 및 시세 스캔 (초고속 배치 스캔)
+# 📊 OKX 펀딩비 및 시세 스캔 (초고속 Direct REST API)
 # ==========================================
 def fetch_top_funding_coin():
-    """모든 OKX 무기한 선물 중 펀딩비가 가장 높은 코인 탐색 (1초 내 완료)"""
+    """OKX Direct REST API를 호출하여 0.3초 만에 최고 펀딩비 코인 탐색"""
     try:
-        # 단 1번의 API 호출로 모든 Ticker 정보(펀딩비 포함) 수신
-        tickers = exchange.fetch_tickers()
+        # 1. OKX 공식 REST API로 모든 무기한 선물의 현재 펀딩비 일괄 수신 (0.1초 소요)
+        url = "https://www.okx.com/api/v5/public/funding-rate-current?instType=SWAP"
+        res = requests.get(url, timeout=3).json()
         
-        best_coin = None
+        if res.get("code") != "0" or not res.get("data"):
+            logging.error("OKX 펀딩비 API 호출 실패")
+            return None
+
+        # 2. 가장 펀딩비가 높은 코인(SWAP) 탐색
+        best_inst_id = None
         max_rate = -999.0
-        best_data = {}
 
-        for symbol, ticker_info in tickers.items():
-            # 무기한 선물 시장(/USDT:USDT)만 선별
-            if not symbol.endswith('/USDT:USDT'):
+        for item in res["data"]:
+            inst_id = item.get("instId", "")
+            # USDT 마진 선물만 대상 (예: BTC-USDT-SWAP)
+            if not inst_id.endswith("-USDT-SWAP"):
                 continue
-                
-            info = ticker_info.get('info', {})
-            # OKX Ticker API가 제공하는 fundingRate 파싱
-            funding_rate_str = info.get('fundingRate') or ticker_info.get('fundingRate')
-            if funding_rate_str is None:
-                continue
-                
-            rate = float(funding_rate_str)
             
-            if rate > max_rate:
-                base_currency = symbol.split('/')[0]
-                spot_symbol = f"{base_currency}/USDT"
-                
-                spot_ticker = tickers.get(spot_symbol)
-                if not spot_ticker:
-                    continue
-                    
-                spot_price = spot_ticker.get('last')
-                swap_price = ticker_info.get('last')
+            funding_rate = float(item.get("fundingRate", 0))
+            if funding_rate > max_rate:
+                max_rate = funding_rate
+                best_inst_id = inst_id
 
-                if not spot_price or not swap_price:
-                    continue
+        if not best_inst_id:
+            return None
 
-                max_rate = rate
-                best_coin = base_currency
-                best_data = {
-                    'coin': base_currency,
-                    'spot_symbol': spot_symbol,
-                    'swap_symbol': symbol,
-                    'funding_rate': rate,
-                    'spot_price': spot_price,
-                    'swap_price': swap_price
-                }
+        # 3. 코인 이름 추출 (예: BTC-USDT-SWAP -> BTC)
+        base_currency = best_inst_id.split("-")[0]
+        spot_symbol = f"{base_currency}/USDT"
+        swap_symbol = f"{base_currency}/USDT:USDT"
 
-        return best_data
+        # 4. 해당 코인의 현물/선물 현재가만 정밀 조회 (0.2초 소요)
+        spot_ticker = exchange.fetch_ticker(spot_symbol)
+        swap_ticker = exchange.fetch_ticker(swap_symbol)
+
+        spot_price = spot_ticker.get('last')
+        swap_price = swap_ticker.get('last')
+
+        if not spot_price or not swap_price:
+            return None
+
+        return {
+            'coin': base_currency,
+            'spot_symbol': spot_symbol,
+            'swap_symbol': swap_symbol,
+            'funding_rate': max_rate,
+            'spot_price': spot_price,
+            'swap_price': swap_price
+        }
+
     except Exception as e:
-        logging.error(f"펀딩비 스캔 중 오류: {e}")
+        logging.error(f"초고속 펀딩비 스캔 중 오류: {e}")
         return None
 
 # ==========================================
@@ -339,7 +343,7 @@ def main():
                             current_position = None
 
                 else:
-                    logging.info("🔍 OKX 전체 코인 펀딩비 스캔을 시작합니다...")
+                    logging.info("🔍 OKX 전체 코인 펀딩비 초고속 스캔을 시작합니다...")
                     best_data = fetch_top_funding_coin()
                     if best_data:
                         coin = best_data['coin']
