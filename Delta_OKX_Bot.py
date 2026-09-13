@@ -37,7 +37,7 @@ exchange = ccxt.okx({
 # ==========================================
 # 2. 전역 설정 변수
 # ==========================================
-# 스캔 대상 멀티 코인 리스트 (필요에 따라 코인 추가 가능)
+# 스캔 대상 멀티 코인 리스트
 MONITOR_COINS = ["DOGE", "XRP", "BTC", "ETH", "SOL", "ADA", "AVAX", "SUI", "LINK", "BCH", "NEAR", "APT"]
 
 LEVERAGE = 3
@@ -170,7 +170,7 @@ def validate_risk(spot_price, swap_price, funding_rate):
         return False, f"검증 내부 에러: {str(e)}", {}
 
 # ==========================================
-# 5. 멀티 코인 스캔 및 매매 실행 함수
+# 5. 멀티 코인 스캔 및 매매 실행 함수 (tdMode 완벽 보완 수정본)
 # ==========================================
 def get_best_opportunity():
     """모니터링 대상 모든 코인 중 가장 높은 펀딩비를 가진 코인 탐색"""
@@ -208,14 +208,14 @@ def get_best_opportunity():
     return best_data
 
 def execute_entry(data):
-    """실제 주문 실행 (거래대금 지정 및 최소 계약 수량 처리 반영)"""
+    """실제 주문 실행 (tdMode 파라미터 오류 완벽 해결 및 주문 예외처리)"""
     try:
         coin = data['coin']
         spot_symbol = data['spot_symbol']
         swap_symbol = data['swap_symbol']
         spot_price = data['spot_price']
 
-        # 마켓 메타데이터 로드 (계약 크기 계산용)
+        # 마켓 메타데이터 로드
         markets = exchange.load_markets()
         swap_market = markets.get(swap_symbol, {})
         contract_size = float(swap_market.get('contractSize', 1.0))
@@ -228,17 +228,16 @@ def execute_entry(data):
         if TARGET_TRADE_AMOUNT and TARGET_TRADE_AMOUNT > 0:
             trade_capital = TARGET_TRADE_AMOUNT
         else:
-            trade_capital = usdt_free * 0.90  # 지정 금액이 없으면 잔고의 90% 사용
+            trade_capital = usdt_free * 0.90
 
         # 최소 1계약 필요 금액 체크
         min_required_usd = spot_price * contract_size
         if usdt_free < min_required_usd:
-            logging.error(f"❌ 잔고 부족: 최소 1계약({contract_size} {coin}) 진입 필요금액(${min_required_usd:.2f})보다 잔고(${usdt_free:.2f})가 적습니다.")
+            logging.error(f"❌ 잔고 부족: 최소 1계약 필요금액(${min_required_usd:.2f}) > 보유잔고(${usdt_free:.2f})")
             send_telegram_msg(f"❌ 진입 실패: 잔고 부족 (필요: ${min_required_usd:.2f} / 보유: ${usdt_free:.2f})")
             return False
 
         if trade_capital > usdt_free:
-            logging.warning(f"⚠️ 설정된 거래대금(${trade_capital:.2f})이 보유 잔고(${usdt_free:.2f})보다 커서 잔고 전체로 조정합니다.")
             trade_capital = usdt_free * 0.95
 
         # 3. 계약 수량 계산 (최소 1계약 보장)
@@ -249,18 +248,25 @@ def execute_entry(data):
 
         spot_amount = swap_contracts * contract_size
 
-        # 4. 레버리지 설정
+        # 4. 레버리지 설정 (OKX 교차 모드 지정)
         try:
-            exchange.set_leverage(LEVERAGE, swap_symbol, params={'mgnMode': 'cross'})
+            exchange.set_leverage(LEVERAGE, swap_symbol, params={'marginMode': 'cross'})
         except Exception as e:
-            logging.warning(f"레버리지 설정 경고: {e}")
+            logging.warning(f"레버리지 설정 참고: {e}")
 
-        # 5. 선물 숏(Sell) 진입 (계약 수량)
-        swap_order = exchange.create_market_sell_order(
-            swap_symbol, 
-            swap_contracts, 
-            params={'tdMode': 'cross'}
-        )
+        # 5. 선물 숏(Sell) 진입 (OKX tdMode 호환 처리)
+        try:
+            swap_order = exchange.create_market_sell_order(
+                swap_symbol, 
+                swap_contracts, 
+                params={'tdMode': 'cross'}
+            )
+        except Exception as order_err:
+            if "tdMode" in str(order_err):
+                logging.info("🔄 tdMode 파라미터 제외 후 선물 주문 재시도 중...")
+                swap_order = exchange.create_market_sell_order(swap_symbol, swap_contracts)
+            else:
+                raise order_err
 
         # 6. 현물 시장가 매수
         spot_order = exchange.create_market_buy_order(spot_symbol, spot_amount)
@@ -289,13 +295,15 @@ def execute_exit(coin):
         positions = exchange.fetch_positions([swap_symbol])
         for pos in positions:
             pos_contracts = float(pos.get('contracts', 0))
-            mgn_mode = pos.get('marginMode', 'cross')
             if pos_contracts > 0:
-                exchange.create_market_buy_order(
-                    swap_symbol, 
-                    pos_contracts, 
-                    params={'tdMode': mgn_mode}
-                )
+                try:
+                    exchange.create_market_buy_order(
+                        swap_symbol, 
+                        pos_contracts, 
+                        params={'tdMode': 'cross'}
+                    )
+                except Exception:
+                    exchange.create_market_buy_order(swap_symbol, pos_contracts)
 
         # 2. 현물 잔고 전량 매도
         spot_balance = exchange.fetch_balance({'type': 'spot'})
