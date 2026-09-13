@@ -35,7 +35,7 @@ exchange = ccxt.okx({
 })
 
 # ==========================================
-# 2. 전역 설정 변수
+# 2. 전역 설정 변수 (기존 구조 유지)
 # ==========================================
 MONITOR_COINS = ["DOGE", "XRP", "BTC", "ETH", "SOL", "ADA", "AVAX", "SUI"]
 
@@ -51,7 +51,7 @@ current_position_coin = None   # 현재 포지션 보유 중인 코인
 last_update_id = None
 
 # ==========================================
-# 3. 텔레그램 연동 함수
+# 3. 텔레그램 연동 함수 (기존 코드 유지)
 # ==========================================
 def send_telegram_msg(message):
     """텔레그램 메시지 발송"""
@@ -131,7 +131,7 @@ def handle_telegram_commands():
         pass
 
 # ==========================================
-# 4. 리스크 검증 함수
+# 4. 리스크 검증 함수 (기존 코드 유지)
 # ==========================================
 def validate_risk(spot_price, swap_price, funding_rate):
     """
@@ -150,7 +150,7 @@ def validate_risk(spot_price, swap_price, funding_rate):
         return False, f"검증 내부 에러: {str(e)}", {}
 
 # ==========================================
-# 5. 멀티 코인 스캔 및 매매 실행 함수
+# 5. 멀티 코인 스캔 및 매매 실행 함수 (계약 단위 수량 자동 변환 완벽 수정)
 # ==========================================
 def get_best_opportunity():
     """모니터링 대상 코인 중 가장 높은 펀딩비를 가진 코인을 탐색"""
@@ -188,12 +188,17 @@ def get_best_opportunity():
     return best_data
 
 def execute_entry(data):
-    """실제 주문 실행 (실시간 잔고 직접 조회 및 잔고 부족 완벽 방지)"""
+    """실제 주문 실행 (계약 단위 수량 자동 변환 적용)"""
     try:
         coin = data['coin']
         spot_symbol = data['spot_symbol']
         swap_symbol = data['swap_symbol']
         spot_price = data['spot_price']
+
+        # 마켓 메타데이터 로드 (계약 크기 및 정밀도 계산용)
+        markets = exchange.load_markets()
+        swap_market = markets.get(swap_symbol, {})
+        contract_size = float(swap_market.get('contractSize', 1.0))  # 예: DOGE는 1장당 100 DOGE
 
         # 1. 실시간 USDT 가능 잔고 조회
         balance = exchange.fetch_balance({'type': 'trading'})
@@ -204,9 +209,22 @@ def execute_entry(data):
             send_telegram_msg(f"❌ 진입 실패: Trading 계좌 USDT 잔고 부족 (${usdt_free:.2f})")
             return False
 
-        # 2. 안전한 진입 수량 계산 (전체 USDT 잔고의 48%만 현물/선물 각각 할당)
-        trade_capital = usdt_free * 0.48
-        amount = trade_capital / spot_price
+        # 2. 안전 진입 금액 계산 (전체 USDT 잔고의 45% 할당)
+        trade_capital = usdt_free * 0.45
+        
+        # 코인 개수 계산
+        raw_amount = trade_capital / spot_price
+
+        # OKX 선물 계약 수량(Contracts)으로 변환 (정수로 버림)
+        swap_contracts = int(raw_amount / contract_size)
+
+        if swap_contracts < 1:
+            logging.error(f"❌ 최소 주문 계약 수량 미달 (계산된 계약 수: {swap_contracts})")
+            send_telegram_msg("❌ 진입 실패: 자본금이 코인 최소 1계약 주문 단위보다 부족합니다.")
+            return False
+
+        # 실제 매수할 현물 수량 (선물 계약 단위에 맞춰 1:1 델타 뉴트럴 정렬)
+        spot_amount = swap_contracts * contract_size
 
         # 3. 레버리지 설정
         try:
@@ -214,18 +232,18 @@ def execute_entry(data):
         except Exception as e:
             logging.warning(f"레버리지 설정 경고: {e}")
 
-        # 4. 선물 숏(Sell) 먼저 진입 (Cross 모드)
+        # 4. 선물 숏(Sell) 먼저 진입 (계약 수량으로 주문)
         swap_order = exchange.create_market_sell_order(
             swap_symbol, 
-            amount, 
+            swap_contracts, 
             params={'tdMode': 'cross'}
         )
 
-        # 5. 현물 시장가 매수
-        spot_order = exchange.create_market_buy_order(spot_symbol, amount)
+        # 5. 현물 시장가 매수 (동일 코인 수량으로 주문)
+        spot_order = exchange.create_market_buy_order(spot_symbol, spot_amount)
 
-        logging.info(f"✅ {coin} 실제 포지션 진입 성공! (수량: {amount:.4f})")
-        send_telegram_msg(f"🚀 [{coin}] 델타 뉴트럴 포지션 진입 완료!\n- 펀딩비: {data['funding_rate']:.4f}%\n- 수량: {amount:.4f}")
+        logging.info(f"✅ {coin} 실제 포지션 진입 성공! (선물: {swap_contracts}계약 / 현물: {spot_amount} {coin})")
+        send_telegram_msg(f"🚀 [{coin}] 델타 뉴트럴 포지션 진입 완료!\n- 펀딩비: {data['funding_rate']:.4f}%\n- 수량: {spot_amount} {coin} ({swap_contracts} 계약)")
         return True
     except Exception as e:
         logging.error(f"❌ 실제 주문 실행 중 오류 발생: {e}")
@@ -233,24 +251,24 @@ def execute_entry(data):
         return False
 
 def execute_exit(coin):
-    """실제 포지션 청산 (선물 숏 닫기 & 현물 매도)"""
+    """실제 포지션 청산"""
     try:
         spot_symbol = f"{coin}/USDT"
         swap_symbol = f"{coin}/USDT:USDT"
 
-        # 1. 선물 포지션 청산
+        # 1. 선물 포지션 전체 청산
         positions = exchange.fetch_positions([swap_symbol])
         for pos in positions:
-            pos_amount = float(pos.get('contracts', 0))
+            pos_contracts = float(pos.get('contracts', 0))
             mgn_mode = pos.get('marginMode', 'cross')
-            if pos_amount > 0:
+            if pos_contracts > 0:
                 exchange.create_market_buy_order(
                     swap_symbol, 
-                    pos_amount, 
+                    pos_contracts, 
                     params={'tdMode': mgn_mode}
                 )
 
-        # 2. 현물 잔고 조회 후 매도
+        # 2. 현물 잔고 전량 매도
         spot_balance = exchange.fetch_balance({'type': 'spot'})
         spot_amount = spot_balance['total'].get(coin, 0)
 
@@ -266,7 +284,7 @@ def execute_exit(coin):
         return False
 
 # ==========================================
-# 6. 메인 자동매매 루프
+# 6. 메인 자동매매 루프 (기존 코드 유지)
 # ==========================================
 def main():
     global has_position, current_position_coin
