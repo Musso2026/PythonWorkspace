@@ -35,13 +35,11 @@ exchange = ccxt.okx({
 })
 
 # ==========================================
-# 2. 전역 설정 변수 (기존 구조 100% 유지)
+# 2. 전역 설정 변수
 # ==========================================
-# 감시할 주요 멀티 코인 리스트 (원하는 코인을 추가/삭제할 수 있습니다)
 MONITOR_COINS = ["DOGE", "XRP", "BTC", "ETH", "SOL", "ADA", "AVAX", "SUI"]
 
 LEVERAGE = 3
-TOTAL_CAPITAL = 145.0  # 원금 ($)
 
 # 펀딩비 설정 (%)
 TARGET_FUNDING_RATE = 0.0100   # 진입 목표 펀딩비 (0.01%)
@@ -53,7 +51,7 @@ current_position_coin = None   # 현재 포지션 보유 중인 코인
 last_update_id = None
 
 # ==========================================
-# 3. 텔레그램 연동 함수 (기존 코드 100% 유지)
+# 3. 텔레그램 연동 함수
 # ==========================================
 def send_telegram_msg(message):
     """텔레그램 메시지 발송"""
@@ -133,19 +131,17 @@ def handle_telegram_commands():
         pass
 
 # ==========================================
-# 4. 리스크 검증 함수 (기존 코드 100% 유지)
+# 4. 리스크 검증 함수
 # ==========================================
 def validate_risk(spot_price, swap_price, funding_rate):
     """
     리스크 검증을 수행하고 (is_valid, reason, details) 3개의 값을 반환함.
     """
     try:
-        # 괴리율 검증 (현물과 선물 가격 차이 1% 이상 시 리스크 거부)
         price_diff_pct = abs(spot_price - swap_price) / spot_price * 100
         if price_diff_pct > 1.0:
             return False, f"현/선물 괴리율 초과 ({price_diff_pct:.2f}%)", {"diff": price_diff_pct}
 
-        # 펀딩비 최저 하한선 검증
         if funding_rate < MIN_FUNDING_LIMIT:
             return False, f"펀딩비 최저 하한 미달 ({funding_rate:.4f}% < {MIN_FUNDING_LIMIT:.4f}%)", {"funding": funding_rate}
 
@@ -154,7 +150,7 @@ def validate_risk(spot_price, swap_price, funding_rate):
         return False, f"검증 내부 에러: {str(e)}", {}
 
 # ==========================================
-# 5. 멀티 코인 스캔 및 매매 실행 함수 (잔고 부족 방지 보완)
+# 5. 멀티 코인 스캔 및 매매 실행 함수
 # ==========================================
 def get_best_opportunity():
     """모니터링 대상 코인 중 가장 높은 펀딩비를 가진 코인을 탐색"""
@@ -192,56 +188,49 @@ def get_best_opportunity():
     return best_data
 
 def execute_entry(data):
-    """실제 주문 실행 (잔고 부족 에러 및 tdMode 완벽 반영)"""
+    """실제 주문 실행 (실시간 잔고 직접 조회 및 잔고 부족 완벽 방지)"""
     try:
         coin = data['coin']
         spot_symbol = data['spot_symbol']
         swap_symbol = data['swap_symbol']
         spot_price = data['spot_price']
 
-        # 1. 레버리지 설정 (Cross 모드 기본)
+        # 1. 실시간 USDT 가능 잔고 조회
+        balance = exchange.fetch_balance({'type': 'trading'})
+        usdt_free = float(balance.get('USDT', {}).get('free', 0))
+
+        if usdt_free < 10.0:
+            logging.error(f"❌ Trading 계좌의 USDT 잔고가 너무 적습니다. (현재: ${usdt_free:.2f})")
+            send_telegram_msg(f"❌ 진입 실패: Trading 계좌 USDT 잔고 부족 (${usdt_free:.2f})")
+            return False
+
+        # 2. 안전한 진입 수량 계산 (전체 USDT 잔고의 48%만 현물/선물 각각 할당)
+        trade_capital = usdt_free * 0.48
+        amount = trade_capital / spot_price
+
+        # 3. 레버리지 설정
         try:
             exchange.set_leverage(LEVERAGE, swap_symbol, params={'mgnMode': 'cross'})
         except Exception as e:
             logging.warning(f"레버리지 설정 경고: {e}")
 
-        # 2. 진입 수량 계산 (수수료 및 오차 방지를 위해 0.5% 여유분 차감)
-        trade_capital = (TOTAL_CAPITAL / 2) * 0.995
-        amount = trade_capital / spot_price
-
-        # 3. 현물 시장가 매수
-        spot_order = exchange.create_market_buy_order(spot_symbol, amount)
-        
-        # 4. 선물 시장가 숏(Sell) 진입 (Cross 모드)
+        # 4. 선물 숏(Sell) 먼저 진입 (Cross 모드)
         swap_order = exchange.create_market_sell_order(
             swap_symbol, 
             amount, 
-            params={
-                'tdMode': 'cross'
-            }
+            params={'tdMode': 'cross'}
         )
+
+        # 5. 현물 시장가 매수
+        spot_order = exchange.create_market_buy_order(spot_symbol, amount)
 
         logging.info(f"✅ {coin} 실제 포지션 진입 성공! (수량: {amount:.4f})")
         send_telegram_msg(f"🚀 [{coin}] 델타 뉴트럴 포지션 진입 완료!\n- 펀딩비: {data['funding_rate']:.4f}%\n- 수량: {amount:.4f}")
         return True
     except Exception as e:
-        # Cross 모드 실패 시 Isolated(격리)로 재시도
-        try:
-            logging.warning("Cross 모드 실패, Isolated(격리) 모드로 재시도합니다.")
-            swap_order = exchange.create_market_sell_order(
-                swap_symbol, 
-                amount, 
-                params={
-                    'tdMode': 'isolated'
-                }
-            )
-            logging.info(f"✅ {coin} 실제 포지션 진입 성공 (Isolated)! (수량: {amount:.4f})")
-            send_telegram_msg(f"🚀 [{coin}] 델타 뉴트럴 포지션 진입 완료!\n- 펀딩비: {data['funding_rate']:.4f}%\n- 수량: {amount:.4f}")
-            return True
-        except Exception as retry_err:
-            logging.error(f"❌ 실제 주문 실행 중 오류 발생: {retry_err}")
-            send_telegram_msg(f"❌ 주문 실행 실패: {retry_err}")
-            return False
+        logging.error(f"❌ 실제 주문 실행 중 오류 발생: {e}")
+        send_telegram_msg(f"❌ 주문 실행 실패: {e}")
+        return False
 
 def execute_exit(coin):
     """실제 포지션 청산 (선물 숏 닫기 & 현물 매도)"""
@@ -249,14 +238,7 @@ def execute_exit(coin):
         spot_symbol = f"{coin}/USDT"
         swap_symbol = f"{coin}/USDT:USDT"
 
-        # 1. 현물 잔고 조회 후 매도
-        spot_balance = exchange.fetch_balance({'type': 'spot'})
-        spot_amount = spot_balance['total'].get(coin, 0)
-
-        if spot_amount > 0:
-            exchange.create_market_sell_order(spot_symbol, spot_amount)
-
-        # 2. 선물 포지션 잔고 조회 후 청산(Buy)
+        # 1. 선물 포지션 청산
         positions = exchange.fetch_positions([swap_symbol])
         for pos in positions:
             pos_amount = float(pos.get('contracts', 0))
@@ -265,10 +247,15 @@ def execute_exit(coin):
                 exchange.create_market_buy_order(
                     swap_symbol, 
                     pos_amount, 
-                    params={
-                        'tdMode': mgn_mode
-                    }
+                    params={'tdMode': mgn_mode}
                 )
+
+        # 2. 현물 잔고 조회 후 매도
+        spot_balance = exchange.fetch_balance({'type': 'spot'})
+        spot_amount = spot_balance['total'].get(coin, 0)
+
+        if spot_amount > 0:
+            exchange.create_market_sell_order(spot_symbol, spot_amount)
 
         logging.info(f"💡 {coin} 포지션 완벽 청산 완료!")
         send_telegram_msg(f"💡 [{coin}] 포지션 청산 완료!")
@@ -279,20 +266,18 @@ def execute_exit(coin):
         return False
 
 # ==========================================
-# 6. 메인 자동매매 루프 (기존 코드 100% 유지)
+# 6. 메인 자동매매 루프
 # ==========================================
 def main():
     global has_position, current_position_coin
     
     delete_webhook()
-    send_telegram_msg(f"🤖 OKX 멀티코인 자동매매 봇 가동 시작 (원금: ${TOTAL_CAPITAL} USDT)")
+    send_telegram_msg("🤖 OKX 멀티코인 자동매매 봇 가동 시작")
 
     while True:
         try:
-            # 텔레그램 명령어 수신 체크
             handle_telegram_commands()
 
-            # 최고 펀딩비 코인 검색
             best_opportunity = get_best_opportunity()
 
             if best_opportunity:
@@ -307,9 +292,6 @@ def main():
                     f"포지션: {'보유 중 (' + str(current_position_coin) + ')' if has_position else '미보유'}"
                 )
 
-                # ----------------------------------
-                # 진입 조건 검사 (미보유 시 최고 조건 코인 진입)
-                # ----------------------------------
                 if not has_position and funding_rate >= TARGET_FUNDING_RATE:
                     logging.info(f"🚀 {coin} 진입 조건 충족! (현재 펀딩비: {funding_rate:.4f}%)")
 
@@ -328,11 +310,7 @@ def main():
                     else:
                         logging.error(f"리스크 검증 중 오류: {reason}")
 
-                # ----------------------------------
-                # 청산 조건 검사 (보유 중인 코인의 펀딩비 체크)
-                # ----------------------------------
                 elif has_position:
-                    # 현재 보유 중인 코인의 펀딩비 가져오기
                     pos_swap_symbol = f"{current_position_coin}/USDT:USDT"
                     pos_funding_info = exchange.fetch_funding_rate(pos_swap_symbol)
                     pos_funding_rate = pos_funding_info['fundingRate'] * 100
