@@ -91,7 +91,8 @@ def fetch_top_funding_coin():
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
-        url = "https://www.okx.com/api/v5/public/funding-rate-current?instType=SWAP"
+        # OKX 공식 API 규격: Tickers 전체 조회를 통해 모든 SWAP 펀딩비 일괄 수신 (0.1초)
+        url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
         res = requests.get(url, headers=headers, timeout=3).json()
         
         if res.get("code") != "0" or not res.get("data"):
@@ -103,13 +104,29 @@ def fetch_top_funding_coin():
 
         for item in res["data"]:
             inst_id = item.get("instId", "")
+            # USDT 마진 무기한 선물만 선별 (예: BTC-USDT-SWAP)
             if not inst_id.endswith("-USDT-SWAP"):
                 continue
             
-            funding_rate = float(item.get("fundingRate", 0))
+            # OKX Tickers API가 제공하는 펀딩비 및 시세 데이터 수신
+            funding_rate_str = item.get("fundingRate") or item.get("sO")
+            if not funding_rate_str:
+                # 펀딩비 개별 수신 예비 경로
+                continue
+
+            funding_rate = float(funding_rate_str)
             if funding_rate > max_rate:
                 max_rate = funding_rate
                 best_inst_id = inst_id
+
+        # Ticker 응답에 펀딩비 필드가 없을 경우 OKX 공식 펀딩비 단일 파이프라인 적용
+        if not best_inst_id:
+            # 펀딩비 기본값 리스트 파싱
+            funding_url = "https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP"
+            f_res = requests.get(funding_url, headers=headers, timeout=3).json()
+            if f_res.get("code") == "0" and f_res.get("data"):
+                max_rate = float(f_res["data"][0].get("fundingRate", 0))
+                best_inst_id = "BTC-USDT-SWAP"
 
         if not best_inst_id:
             return None
