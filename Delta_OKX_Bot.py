@@ -192,34 +192,32 @@ def get_best_opportunity():
     return best_data
 
 def execute_entry(data):
-    """실제 주문 실행 (현물 매수 & 선물 숏 - tdMode 오류 수정 완)"""
+    """실제 주문 실행 (현물 매수 & 선물 숏 - OKX tdMode 이슈 완벽 수정)"""
     try:
         coin = data['coin']
         spot_symbol = data['spot_symbol']
         swap_symbol = data['swap_symbol']
         spot_price = data['spot_price']
 
-        # 1. 레버리지 설정 (Cross 모드 지정)
+        # 1. 레버리지 설정 (Cross 모드 적용)
         try:
             exchange.set_leverage(LEVERAGE, swap_symbol, params={'mgnMode': 'cross'})
         except Exception as e:
-            logging.warning(f"레버리지 설정 경고 (이미 설정되어 있을 수 있음): {e}")
+            logging.warning(f"레버리지 설정 경고: {e}")
 
-        # 2. 진입 수량 계산 (총 자본의 절반으로 현물/선물 각 진입)
+        # 2. 진입 수량 계산
         trade_capital = TOTAL_CAPITAL / 2
         amount = trade_capital / spot_price
 
-        # 3. 현물 시장가 매수 (tdMode: 'cash' 명시)
-        spot_order = exchange.create_market_buy_order(
-            spot_symbol, 
-            amount, 
-            params={'tdMode': 'cash'}
-        )
+        # 3. 현물 시장가 매수 (현물은 tdMode 파라미터 없이 기본 매수)
+        spot_order = exchange.create_market_buy_order(spot_symbol, amount)
         
-        # 4. 선물 시장가 숏(Sell) 진입 (tdMode: 'cross' 명시)
-        swap_order = exchange.create_market_sell_order(
-            swap_symbol, 
-            amount, 
+        # 4. 선물 시장가 숏(Sell) 진입 (OKX 공식 교차 모드 tdMode: 'cross' 적용)
+        swap_order = exchange.create_order(
+            symbol=swap_symbol,
+            type='market',
+            side='sell',
+            amount=amount,
             params={'tdMode': 'cross'}
         )
 
@@ -232,30 +230,28 @@ def execute_entry(data):
         return False
 
 def execute_exit(coin):
-    """실제 포지션 청산 (선물 숏 닫기 & 현물 매도 - tdMode 오류 수정 완)"""
+    """실제 포지션 청산 (선물 숏 닫기 & 현물 매도 - OKX tdMode 이슈 완벽 수정)"""
     try:
         spot_symbol = f"{coin}/USDT"
         swap_symbol = f"{coin}/USDT:USDT"
 
-        # 1. 현물 잔고 조회 후 매도 (tdMode: 'cash' 명시)
+        # 1. 현물 잔고 조회 후 매도
         spot_balance = exchange.fetch_balance({'type': 'spot'})
         spot_amount = spot_balance['total'].get(coin, 0)
 
         if spot_amount > 0:
-            exchange.create_market_sell_order(
-                spot_symbol, 
-                spot_amount, 
-                params={'tdMode': 'cash'}
-            )
+            exchange.create_market_sell_order(spot_symbol, spot_amount)
 
-        # 2. 선물 포지션 잔고 조회 후 청산(Buy) (tdMode: 'cross' 명시)
+        # 2. 선물 포지션 잔고 조회 후 청산(Buy)
         positions = exchange.fetch_positions([swap_symbol])
         for pos in positions:
             pos_amount = float(pos.get('contracts', 0))
             if pos_amount > 0:
-                exchange.create_market_buy_order(
-                    swap_symbol, 
-                    pos_amount, 
+                exchange.create_order(
+                    symbol=swap_symbol,
+                    type='market',
+                    side='buy',
+                    amount=pos_amount,
                     params={'tdMode': 'cross'}
                 )
 
