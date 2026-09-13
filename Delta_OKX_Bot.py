@@ -83,49 +83,55 @@ def get_telegram_updates(last_update_id):
     return [], last_update_id
 
 # ==========================================
-# 📊 OKX 펀딩비 및 시세 스캔
+# 📊 OKX 펀딩비 및 시세 스캔 (초고속 배치 스캔)
 # ==========================================
 def fetch_top_funding_coin():
-    """모든 OKX 무기한 선물 중 펀딩비가 가장 높은 코인 탐색"""
+    """모든 OKX 무기한 선물 중 펀딩비가 가장 높은 코인 탐색 (1초 내 완료)"""
     try:
+        # 단 1번의 API 호출로 모든 Ticker 정보(펀딩비 포함) 수신
         tickers = exchange.fetch_tickers()
-        swap_tickers = [symbol for symbol in tickers if symbol.endswith('/USDT:USDT')]
         
         best_coin = None
         max_rate = -999.0
         best_data = {}
 
-        for swap_symbol in swap_tickers:
-            try:
-                funding_info = exchange.fetch_funding_rate(swap_symbol)
-                rate = funding_info.get('fundingRate', 0)
-                
-                if rate > max_rate:
-                    base_currency = swap_symbol.split('/')[0]
-                    spot_symbol = f"{base_currency}/USDT"
-                    
-                    spot_ticker = tickers.get(spot_symbol)
-                    if not spot_ticker:
-                        continue
-                        
-                    spot_price = spot_ticker.get('last')
-                    swap_price = tickers[swap_symbol].get('last')
-
-                    if not spot_price or not swap_price:
-                        continue
-
-                    max_rate = rate
-                    best_coin = base_currency
-                    best_data = {
-                        'coin': base_currency,
-                        'spot_symbol': spot_symbol,
-                        'swap_symbol': swap_symbol,
-                        'funding_rate': rate,
-                        'spot_price': spot_price,
-                        'swap_price': swap_price
-                    }
-            except Exception:
+        for symbol, ticker_info in tickers.items():
+            # 무기한 선물 시장(/USDT:USDT)만 선별
+            if not symbol.endswith('/USDT:USDT'):
                 continue
+                
+            info = ticker_info.get('info', {})
+            # OKX Ticker API가 제공하는 fundingRate 파싱
+            funding_rate_str = info.get('fundingRate') or ticker_info.get('fundingRate')
+            if funding_rate_str is None:
+                continue
+                
+            rate = float(funding_rate_str)
+            
+            if rate > max_rate:
+                base_currency = symbol.split('/')[0]
+                spot_symbol = f"{base_currency}/USDT"
+                
+                spot_ticker = tickers.get(spot_symbol)
+                if not spot_ticker:
+                    continue
+                    
+                spot_price = spot_ticker.get('last')
+                swap_price = ticker_info.get('last')
+
+                if not spot_price or not swap_price:
+                    continue
+
+                max_rate = rate
+                best_coin = base_currency
+                best_data = {
+                    'coin': base_currency,
+                    'spot_symbol': spot_symbol,
+                    'swap_symbol': symbol,
+                    'funding_rate': rate,
+                    'spot_price': spot_price,
+                    'swap_price': swap_price
+                }
 
         return best_data
     except Exception as e:
@@ -275,8 +281,13 @@ def process_telegram_commands(last_update_id, current_position):
     
     for update in updates:
         msg = update.get('message', {}).get('text', '')
+        chat_id = update.get('message', {}).get('chat', {}).get('id', '')
+        
+        if msg:
+            logging.info(f"📩 텔레그램 메시지 수신: '{msg}' (Chat ID: {chat_id})")
         
         if msg == '/status':
+            logging.info("👉 /status 명령어 감지됨 -> 텔레그램 답장 전송 중")
             if current_position:
                 send_telegram_msg(f"📌 [현재 포지션 보유 중]\n코인: {current_position['coin']}\n진입 펀딩비: {current_position['funding_rate']*100:.4f}%")
             else:
@@ -308,7 +319,7 @@ def main():
 
     while True:
         try:
-            # 1. 텔레그램 명령어 수신 (실시간 응답)
+            # 1. 텔레그램 명령어 수신 (1초 마다 감지)
             last_update_id, current_position = process_telegram_commands(last_update_id, current_position)
 
             # 2. 5분마다 펀딩비 스캔 및 포지션 관리 진행
@@ -352,7 +363,6 @@ def main():
         except Exception as e:
             logging.error(f"메인 루프 예외 발생: {e}")
 
-        # 1초마다 루프를 돌면서 텔레그램 명령어를 감지함
         time.sleep(1)
 
 if __name__ == "__main__":
