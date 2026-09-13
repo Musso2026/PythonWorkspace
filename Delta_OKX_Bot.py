@@ -154,7 +154,7 @@ def validate_risk(spot_price, swap_price, funding_rate):
         return False, f"검증 내부 에러: {str(e)}", {}
 
 # ==========================================
-# 5. 멀티 코인 스캔 및 매매 실행 함수 (수정 반영 부분)
+# 5. 멀티 코인 스캔 및 매매 실행 함수 (잔고 부족 방지 보완)
 # ==========================================
 def get_best_opportunity():
     """모니터링 대상 코인 중 가장 높은 펀딩비를 가진 코인을 탐색"""
@@ -192,34 +192,32 @@ def get_best_opportunity():
     return best_data
 
 def execute_entry(data):
-    """실제 주문 실행 (현물 매수 & 선물 숏 - OKX tdMode 이슈 완전 해결)"""
+    """실제 주문 실행 (잔고 부족 에러 및 tdMode 완벽 반영)"""
     try:
         coin = data['coin']
         spot_symbol = data['spot_symbol']
         swap_symbol = data['swap_symbol']
         spot_price = data['spot_price']
 
-        # 1. 레버리지 설정 (Cross/Isolated 구분 없이 안전하게 적용)
+        # 1. 레버리지 설정 (Cross 모드 기본)
         try:
             exchange.set_leverage(LEVERAGE, swap_symbol, params={'mgnMode': 'cross'})
         except Exception as e:
             logging.warning(f"레버리지 설정 경고: {e}")
 
-        # 2. 진입 수량 계산
-        trade_capital = TOTAL_CAPITAL / 2
+        # 2. 진입 수량 계산 (수수료 및 오차 방지를 위해 0.5% 여유분 차감)
+        trade_capital = (TOTAL_CAPITAL / 2) * 0.995
         amount = trade_capital / spot_price
 
         # 3. 현물 시장가 매수
         spot_order = exchange.create_market_buy_order(spot_symbol, amount)
         
-        # 4. 선물 시장가 숏(Sell) 진입 
-        # CCXT 최신 규격 반영: create_market_sell_order 사용
+        # 4. 선물 시장가 숏(Sell) 진입 (Cross 모드)
         swap_order = exchange.create_market_sell_order(
             swap_symbol, 
             amount, 
             params={
-                'tdMode': 'cross',
-                'marginMode': 'cross'
+                'tdMode': 'cross'
             }
         )
 
@@ -227,15 +225,14 @@ def execute_entry(data):
         send_telegram_msg(f"🚀 [{coin}] 델타 뉴트럴 포지션 진입 완료!\n- 펀딩비: {data['funding_rate']:.4f}%\n- 수량: {amount:.4f}")
         return True
     except Exception as e:
-        # Cross로 실패할 경우 Isolated(격리)로 2차 시도
+        # Cross 모드 실패 시 Isolated(격리)로 재시도
         try:
             logging.warning("Cross 모드 실패, Isolated(격리) 모드로 재시도합니다.")
             swap_order = exchange.create_market_sell_order(
                 swap_symbol, 
                 amount, 
                 params={
-                    'tdMode': 'isolated',
-                    'marginMode': 'isolated'
+                    'tdMode': 'isolated'
                 }
             )
             logging.info(f"✅ {coin} 실제 포지션 진입 성공 (Isolated)! (수량: {amount:.4f})")
@@ -247,7 +244,7 @@ def execute_entry(data):
             return False
 
 def execute_exit(coin):
-    """실제 포지션 청산 (선물 숏 닫기 & 현물 매도 - OKX tdMode 이슈 완전 해결)"""
+    """실제 포지션 청산 (선물 숏 닫기 & 현물 매도)"""
     try:
         spot_symbol = f"{coin}/USDT"
         swap_symbol = f"{coin}/USDT:USDT"
@@ -263,14 +260,13 @@ def execute_exit(coin):
         positions = exchange.fetch_positions([swap_symbol])
         for pos in positions:
             pos_amount = float(pos.get('contracts', 0))
-            mgn_mode = pos.get('marginMode', 'cross') # 보유 포지션의 마진 모드 확인
+            mgn_mode = pos.get('marginMode', 'cross')
             if pos_amount > 0:
                 exchange.create_market_buy_order(
                     swap_symbol, 
                     pos_amount, 
                     params={
-                        'tdMode': mgn_mode,
-                        'marginMode': mgn_mode
+                        'tdMode': mgn_mode
                     }
                 )
 
