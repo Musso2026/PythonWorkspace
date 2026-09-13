@@ -54,29 +54,33 @@ exchange = ccxt.okx({
 # 📲 텔레그램 알림 및 상태 관리
 # ==========================================
 def send_telegram_msg(message):
-    """텔레그램 메시지 전송 (예외 발생 시 봇 멈춤 방지)"""
+    """텔레그램 메시지 전송"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-        requests.post(url, json=payload, timeout=3)  # 타임아웃 3초로 단축
+        requests.post(url, json=payload, timeout=3)
     except Exception as e:
-        logging.warning(f"⚠️ 텔레그램 메시지 전송 실패 (무시하고 진행): {e}")
+        logging.warning(f"⚠️ 텔레그램 메시지 전송 실패: {e}")
 
 def get_telegram_updates(last_update_id):
     """텔레그램 사용자 명령어 수신"""
     if not TELEGRAM_TOKEN:
-        return []
+        return [], last_update_id
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
         params = {"offset": last_update_id + 1, "timeout": 1}
         res = requests.get(url, params=params, timeout=2).json()
         if res.get("ok"):
-            return res.get("result", [])
+            results = res.get("result", [])
+            new_last_id = last_update_id
+            for u in results:
+                new_last_id = max(new_last_id, u["update_id"])
+            return results, new_last_id
     except Exception:
         pass
-    return []
+    return [], last_update_id
 
 # ==========================================
 # 📊 OKX 펀딩비 및 시세 스캔
@@ -262,80 +266,94 @@ def execute_exit(position):
         return False
 
 # ==========================================
-# 🔄 메인 루프 (자동 매매)
+# 🔄 메인 루프 (자동 매매 & 실시간 텔레그램 수신)
 # ==========================================
+def process_telegram_commands(last_update_id, current_position):
+    """텔레그램 명령어를 실시간으로 처리하는 함수"""
+    global TARGET_TRADE_AMOUNT
+    updates, next_id = get_telegram_updates(last_update_id)
+    
+    for update in updates:
+        msg = update.get('message', {}).get('text', '')
+        
+        if msg == '/status':
+            if current_position:
+                send_telegram_msg(f"📌 [현재 포지션 보유 중]\n코인: {current_position['coin']}\n진입 펀딩비: {current_position['funding_rate']*100:.4f}%")
+            else:
+                send_telegram_msg("📌 [포지션 미보유] 조건 충족 코인을 탐색 중입니다.")
+        elif msg.startswith('/setamount'):
+            try:
+                val = float(msg.split()[1])
+                TARGET_TRADE_AMOUNT = val
+                send_telegram_msg(f"⚙️ 진입 대금이 ${TARGET_TRADE_AMOUNT}로 변경되었습니다.")
+            except:
+                send_telegram_msg("⚠️ 올바른 형식: /setamount 100")
+        elif msg == '/exit':
+            if current_position:
+                if execute_exit(current_position):
+                    current_position = None
+            else:
+                send_telegram_msg("⚠️ 청산할 포지션이 없습니다.")
+
+    return next_id, current_position
+
 def main():
     current_position = None
     last_update_id = 0
-    global TARGET_TRADE_AMOUNT
 
-    # 로그 기록을 최우선 실행
     logging.info("🤖 OKX 델타 뉴트럴 봇 프로세스가 시작되었습니다!")
     send_telegram_msg("🤖 OKX 델타 뉴트럴 봇이 성공적으로 시작되었습니다!")
 
+    last_scan_time = 0
+
     while True:
         try:
-            updates = get_telegram_updates(last_update_id)
-            for update in updates:
-                last_update_id = update['update_id']
-                msg = update.get('message', {}).get('text', '')
-                
-                if msg == '/status':
-                    if current_position:
-                        send_telegram_msg(f"📌 [현재 포지션 보유 중]\n코인: {current_position['coin']}\n진입 펀딩비: {current_position['funding_rate']*100:.4f}%")
-                    else:
-                        send_telegram_msg("📌 [포지션 미보유] 조건 충족 코인을 탐색 중입니다.")
-                elif msg.startswith('/setamount'):
-                    try:
-                        val = float(msg.split()[1])
-                        TARGET_TRADE_AMOUNT = val
-                        send_telegram_msg(f"⚙️ 진입 대금이 ${TARGET_TRADE_AMOUNT}로 변경되었습니다.")
-                    except:
-                        send_telegram_msg("⚠️ 올바른 형식: /setamount 100")
-                elif msg == '/exit':
-                    if current_position:
+            # 1. 텔레그램 명령어 수신 (실시간 응답)
+            last_update_id, current_position = process_telegram_commands(last_update_id, current_position)
+
+            # 2. 5분마다 펀딩비 스캔 및 포지션 관리 진행
+            current_time = time.time()
+            if current_time - last_scan_time >= CHECK_INTERVAL:
+                last_scan_time = current_time
+
+                if current_position:
+                    funding_info = exchange.fetch_funding_rate(current_position['swap_symbol'])
+                    current_rate = funding_info.get('fundingRate', 0)
+                    
+                    logging.info(f"[{current_position['coin']}] 보유 중 | 현재 펀딩비: {current_rate*100:.4f}% (청산 목표: {EXIT_FUNDING_RATE*100:.4f}%)")
+                    
+                    if current_rate <= EXIT_FUNDING_RATE:
+                        logging.info("📉 펀딩비가 청산 목표치 이하로 하락하여 청산을 시도합니다.")
                         if execute_exit(current_position):
                             current_position = None
-                    else:
-                        send_telegram_msg("⚠️ 청산할 포지션이 없습니다.")
 
-            if current_position:
-                funding_info = exchange.fetch_funding_rate(current_position['swap_symbol'])
-                current_rate = funding_info.get('fundingRate', 0)
-                
-                logging.info(f"[{current_position['coin']}] 보유 중 | 현재 펀딩비: {current_rate*100:.4f}% (청산 목표: {EXIT_FUNDING_RATE*100:.4f}%)")
-                
-                if current_rate <= EXIT_FUNDING_RATE:
-                    logging.info("📉 펀딩비가 청산 목표치 이하로 하락하여 청산을 시도합니다.")
-                    if execute_exit(current_position):
-                        current_position = None
+                else:
+                    logging.info("🔍 OKX 전체 코인 펀딩비 스캔을 시작합니다...")
+                    best_data = fetch_top_funding_coin()
+                    if best_data:
+                        coin = best_data['coin']
+                        rate = best_data['funding_rate']
+                        spot_p = best_data['spot_price']
+                        swap_p = best_data['swap_price']
+                        
+                        amount_str = f"${TARGET_TRADE_AMOUNT}" if TARGET_TRADE_AMOUNT > 0 else "잔고 자동(85%)"
+                        logging.info(
+                            f"[최고 펀딩비 코인: {coin}] 레버리지: {LEVERAGE}x | 현물: ${spot_p} | 선물: ${swap_p} | "
+                            f"현재 펀딩비: {rate*100:.4f}% (목표: {TARGET_FUNDING_RATE*100:.4f}%) | 진입대금 설정: {amount_str} | 포지션: 미보유"
+                        )
 
-            else:
-                logging.info("🔍 OKX 전체 코인 펀딩비 스캔을 시작합니다...")
-                best_data = fetch_top_funding_coin()
-                if best_data:
-                    coin = best_data['coin']
-                    rate = best_data['funding_rate']
-                    spot_p = best_data['spot_price']
-                    swap_p = best_data['swap_price']
-                    
-                    amount_str = f"${TARGET_TRADE_AMOUNT}" if TARGET_TRADE_AMOUNT > 0 else "잔고 자동(85%)"
-                    logging.info(
-                        f"[최고 펀딩비 코인: {coin}] 레버리지: {LEVERAGE}x | 현물: ${spot_p} | 선물: ${swap_p} | "
-                        f"현재 펀딩비: {rate*100:.4f}% (목표: {TARGET_FUNDING_RATE*100:.4f}%) | 진입대금 설정: {amount_str} | 포지션: 미보유"
-                    )
-
-                    if rate >= TARGET_FUNDING_RATE:
-                        logging.info(f"🚀 {coin} 진입 조건 충족! (현재 펀딩비: {rate*100:.4f}%)")
-                        if validate_entry(best_data):
-                            logging.info(f"✅ {coin} 리스크 검증 통과! 매수/숏 포지션 진입을 시도합니다.")
-                            if execute_entry(best_data):
-                                current_position = best_data
+                        if rate >= TARGET_FUNDING_RATE:
+                            logging.info(f"🚀 {coin} 진입 조건 충족! (현재 펀딩비: {rate*100:.4f}%)")
+                            if validate_entry(best_data):
+                                logging.info(f"✅ {coin} 리스크 검증 통과! 매수/숏 포지션 진입을 시도합니다.")
+                                if execute_entry(best_data):
+                                    current_position = best_data
 
         except Exception as e:
             logging.error(f"메인 루프 예외 발생: {e}")
 
-        time.sleep(CHECK_INTERVAL)
+        # 1초마다 루프를 돌면서 텔레그램 명령어를 감지함
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()
