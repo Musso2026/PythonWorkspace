@@ -34,11 +34,14 @@ TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID")
 
 INITIAL_DEPOSIT_USDT = float(os.getenv("INITIAL_DEPOSIT_USDT", 145.00))
 
-# 🎯 펀딩비 및 안전 하한선 설정
-ABSOLUTE_MIN_FUNDING = 0.0001 # 하한선 0.01%
+# 🎯 펀딩비 및 안전 하한선 설정 (텔레그램 변경 가능)
+ABSOLUTE_MIN_FUNDING = 0.0001 # 최저 진입 하한선 (0.01%)
 MIN_FUNDING_RATE = 0.0001     # 기본 진입 기준 (0.01%)
 EXIT_FUNDING_RATE = 0.00005   # 청산 하한선 (0.005%)
 MIN_VOLUME_USDT = 5000000.0   # 기본 최소 거래대금 ($5,000,000)
+
+# 🛡️ 부동소수점 오차 보정용 Epsilon
+EPSILON = 1e-9
 
 # 🛡️ 손절/익절 및 변동성 필터 설정
 STOP_LOSS_PCT = 0.03          # 손절 비율 (3% 변동시 거래소 서버 손절)
@@ -312,7 +315,10 @@ async def check_risk_and_liquidity(symbol_swap: str, symbol_spot: str, required_
         swap_bids_depth = sum([price * qty for price, qty in swap_ob['bids']])
 
         if spot_asks_depth < required_usdt * 2 or swap_bids_depth < required_usdt * 2:
-            logging.warning(f"⚠️ [유동성 부족] 호가창 깊이 미달로 진입 거부 ({symbol_swap})")
+            logging.warning(
+                f"⚠️ [진입 거부: 유동성 부족] {symbol_swap} 호가창 깊이 미달 "
+                f"(필요: ${required_usdt * 2:.1f} | 현물잔량: ${spot_asks_depth:.1f}, 선물잔량: ${swap_bids_depth:.1f})"
+            )
             return False
 
         ohlcv = await async_okx.fetch_ohlcv(symbol_swap, timeframe='1h', limit=15)
@@ -330,7 +336,7 @@ async def check_risk_and_liquidity(symbol_swap: str, symbol_spot: str, required_
             atr_ratio = atr / current_price
 
             if atr_ratio > MAX_ATR_RATIO:
-                logging.warning(f"⚠️ [고변동성 위험] ATR 비율({atr_ratio*100:.2f}%) 초과로 진입 거부 ({symbol_swap})")
+                logging.warning(f"⚠️ [진입 거부: 고변동성 위험] {symbol_swap} ATR 비율({atr_ratio*100:.2f}% > 기준 {MAX_ATR_RATIO*100:.2f}%) 초과")
                 return False
 
         return True
@@ -344,7 +350,6 @@ async def check_risk_and_liquidity(symbol_swap: str, symbol_spot: str, required_
 async def find_best_funding_coin():
     global TARGET_COIN, MIN_VOLUME_USDT
     try:
-        # 🛡️ 상태 락 체크: 매매 작업 중일 경우 종목 스캔 보류
         if TRADING_LOCK.locked():
             return
 
@@ -382,13 +387,14 @@ async def find_best_funding_coin():
         for (sym, coin, volume), result in zip(candidate_symbols, funding_results):
             if isinstance(result, dict) and 'fundingRate' in result:
                 rate = float(result.get('fundingRate', 0.0) or 0.0)
-                if rate >= ABSOLUTE_MIN_FUNDING and rate > best_funding:
+                # 오차 보정치 EPSILON 반영
+                if (rate + EPSILON) >= ABSOLUTE_MIN_FUNDING and rate > best_funding:
                     best_funding = rate
                     best_coin = coin
 
         t_scan_ms = (time.perf_counter_ns() - t_start_ns) / 1_000_000.0
 
-        if best_coin and best_funding >= ABSOLUTE_MIN_FUNDING:
+        if best_coin and (best_funding + EPSILON) >= ABSOLUTE_MIN_FUNDING:
             if best_coin != TARGET_COIN:
                 spot_sym = f"{best_coin}/USDT"
                 swap_sym = f"{best_coin}/USDT:USDT"
@@ -426,6 +432,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += f"• 스위치 상태: {switch_str}\n"
     msg += f"• 설정 레버리지: {TARGET_LEVERAGE}배\n"
     msg += f"• 검색 기준 거래대금: ${MIN_VOLUME_USDT:,.0f} USDT\n"
+    msg += f"• 최저 하한 펀딩비: {ABSOLUTE_MIN_FUNDING * 100:.4f}%\n"
     msg += f"• 최소 진입 펀딩비: {MIN_FUNDING_RATE * 100:.4f}%\n"
     msg += f"• 청산 기준 펀딩비: {EXIT_FUNDING_RATE * 100:.4f}%\n"
     msg += f"• 입금 원금 자산: ${INITIAL_DEPOSIT_USDT:.2f} USDT (약 {INITIAL_DEPOSIT_USDT * krw_rate:,.0f}원)\n"
@@ -485,25 +492,40 @@ async def setlev_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ 설정 실패: {e}")
 
+# 🎯 펀딩비 설정 명령어 확장 (최저 하한선 인자 추가 지원)
 async def setfund_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(TELEGRAM_ADMIN_ID):
         return
-    global MIN_FUNDING_RATE, EXIT_FUNDING_RATE
+    global MIN_FUNDING_RATE, EXIT_FUNDING_RATE, ABSOLUTE_MIN_FUNDING
     if len(context.args) < 1:
-        await update.message.reply_text("⚠️ **사용법**: `/setfund 0.025` 또는 `/setfund 0.025 0.005` (단위: %)")
+        await update.message.reply_text(
+            "⚠️ **사용법**:\n"
+            "• `/setfund 0.025` (진입: 0.025%로 변경)\n"
+            "• `/setfund 0.025 0.005` (진입: 0.025%, 청산: 0.005%)\n"
+            "• `/setfund 0.025 0.005 0.001` (진입: 0.025%, 청산: 0.005%, 최저하한선: 0.001%)\n"
+            f"\n현재 설정값: 진입({MIN_FUNDING_RATE*100:.4f}%), 청산({EXIT_FUNDING_RATE*100:.4f}%), 최저하한({ABSOLUTE_MIN_FUNDING*100:.4f}%)"
+        )
         return
     try:
         new_min = float(context.args[0]) / 100.0
         new_exit = float(context.args[1]) / 100.0 if len(context.args) >= 2 else EXIT_FUNDING_RATE
-
+        
+        # 세 번째 인자 존재시 최저 하한선까지 직접 조정
+        if len(context.args) >= 3:
+            ABSOLUTE_MIN_FUNDING = float(context.args[2]) / 100.0
+        
+        # 하한선 체크
         if new_min < ABSOLUTE_MIN_FUNDING:
-            await update.message.reply_text("⚠️ 경고: 진입 펀딩비가 0.01% 이하일 경우 강제 하한 0.01%가 적용됩니다.")
+            await update.message.reply_text(f"ℹ️ 설정한 진입 펀딩비가 최저 하한선({ABSOLUTE_MIN_FUNDING*100:.4f}%)보다 낮아 하한선 수치로 자동 맞춰집니다.")
             new_min = ABSOLUTE_MIN_FUNDING
 
         MIN_FUNDING_RATE = new_min
         EXIT_FUNDING_RATE = new_exit
         await update.message.reply_text(
-            f"🎯 **펀딩비 변경 완료**\n진입: {MIN_FUNDING_RATE * 100:.4f}%\n청산: {EXIT_FUNDING_RATE * 100:.4f}%"
+            f"🎯 **펀딩비 기준 변경 완료**\n"
+            f"• 최저 진입 하한선: {ABSOLUTE_MIN_FUNDING * 100:.4f}%\n"
+            f"• 최소 진입 기준: {MIN_FUNDING_RATE * 100:.4f}%\n"
+            f"• 청산 기준: {EXIT_FUNDING_RATE * 100:.4f}%"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ 설정 실패: {e}")
@@ -584,9 +606,6 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 🛡️ 7-1. OKX 거래소 서버형 TPSL (Retry & 미등록 시 자동 강제 청산 보완)
 # ==========================================
 async def set_server_side_tpsl_with_retry(swap_symbol: str, side: str, trigger_sl_price: float, trigger_tp_price: float, max_retries: int = 3) -> bool:
-    """
-    TPSL 등록을 최대 3회 재시도하며, 모두 실패할 경우 False를 반환하여 호출부가 강제 청산(Rollback)하도록 조치
-    """
     sl_price_str = f"{trigger_sl_price:.4f}"
     tp_price_str = f"{trigger_tp_price:.4f}"
 
@@ -619,18 +638,17 @@ async def set_server_side_tpsl_with_retry(swap_symbol: str, side: str, trigger_s
     return False
 
 # ==========================================
-# 7-2. 🔥 초고속 BATCH 주문 (Lock & 파라미터 구조 완벽 보완)
+# 7-2. 🔥 초고속 BATCH 주문 (상세 진입실패 로깅 보완)
 # ==========================================
 async def execute_delta_neutral_entry_async():
     global POSITION_BASE_USDT
     
-    # 🛡️ 상태 락을 통해 진입/청산의 중복 실행 방지
     async with TRADING_LOCK:
         usdt_free, total_eq, _ = await get_balance_async()
         available_usdt = usdt_free * 0.95
 
         if available_usdt < 10.0:
-            logging.warning("⚠️ 가용 USDT 잔고 부족 (최소 10 USDT 필요)")
+            logging.warning(f"⚠️ [진입 중단] 가용 USDT 잔고 부족 (현재: ${available_usdt:.2f} / 최소 필요: 10 USDT)")
             return False
 
         if not await check_risk_and_liquidity(SYMBOL_SWAP, SYMBOL_SPOT, available_usdt):
@@ -638,6 +656,7 @@ async def execute_delta_neutral_entry_async():
 
         spot_price, swap_price = await get_ticker_prices_async()
         if spot_price <= 0 or swap_price <= 0:
+            logging.warning("⚠️ [진입 중단] 시세 조회 결과가 0 이하입니다.")
             return False
 
         cost_per_contract = (swap_price * COIN_SPEC['ctVal']) / TARGET_LEVERAGE
@@ -646,14 +665,13 @@ async def execute_delta_neutral_entry_async():
         spot_amount = truncate_value(swap_contracts * COIN_SPEC['ctVal'], COIN_SPEC['spot_amount_prec'])
 
         if spot_amount < COIN_SPEC['spot_min_amount'] or swap_contracts < COIN_SPEC['swap_min_amount']:
-            logging.warning(f"⚠️ 최소 주문 수량 미달 (현물: {spot_amount}, 선물: {swap_contracts})")
+            logging.warning(f"⚠️ [진입 중단] 최소 주문 수량 미달 (현물: {spot_amount} / 필요: {COIN_SPEC['spot_min_amount']}, 선물: {swap_contracts} / 필요: {COIN_SPEC['swap_min_amount']})")
             return False
 
         try:
             t_start_ns = time.perf_counter_ns()
             logging.info(f"⚡ [OKX Batch Orders 진입 시작] 선물 숏: {swap_contracts} Cont | 현물 매수: {spot_amount}")
 
-            # OKX 규격 및 tgtCcy, posSide 반영
             orders_payload = [
                 {
                     'symbol': SYMBOL_SWAP,
@@ -682,7 +700,6 @@ async def execute_delta_neutral_entry_async():
                 swap_success = 'id' in results[0] and results[0]['id'] is not None
                 spot_success = 'id' in results[1] and results[1]['id'] is not None
 
-            # 불균형 체결시 즉시 롤백
             if not (swap_success and spot_success):
                 logging.error("🚨 [비대칭 체결 감지] 한 쪽 주문 실패! 즉시 롤백 청산을 집행합니다.")
                 await _raw_exit_execution("비대칭 체결 즉시 롤백")
@@ -690,7 +707,6 @@ async def execute_delta_neutral_entry_async():
 
             POSITION_BASE_USDT = total_eq
 
-            # 🛡️ TPSL 재시도 및 실패 시 즉시 청산 안전망 적용
             sl_trigger_price = swap_price * (1.0 + STOP_LOSS_PCT)
             tp_trigger_price = swap_price * (1.0 - TAKE_PROFIT_PCT)
             
@@ -759,7 +775,7 @@ async def _raw_exit_execution(reason: str) -> bool:
         return False
 
 # ==========================================
-# 8. 매매 주기 비동기 실행 루프 (Rate Limit 고려 5초 지정)
+# 8. 매매 주기 비동기 실행 루프 (EPSILON 및 로깅 보완)
 # ==========================================
 async def trade_logic_cycle_async():
     if not BOT_SWITCH or TRADING_LOCK.locked():
@@ -771,15 +787,16 @@ async def trade_logic_cycle_async():
 
     logging.info(
         f"[{TARGET_COIN} 감시 중] 레버리지: {TARGET_LEVERAGE}x | 현물: ${spot_price:.4f} | 선물: ${swap_price:.4f} | "
-        f"현재 펀딩비: {funding_rate*100:.4f}% (목표: {MIN_FUNDING_RATE*100:.4f}%) | "
+        f"현재 펀딩비: {funding_rate*100:.4f}% (목표: {MIN_FUNDING_RATE*100:.4f}%, 최저하한: {ABSOLUTE_MIN_FUNDING*100:.4f}%) | "
         f"포지션: {'보유' if pos else '미보유'}"
     )
 
-    if not pos and funding_rate >= MIN_FUNDING_RATE and funding_rate >= ABSOLUTE_MIN_FUNDING:
+    # 🛡️ 부동소수점 오차 보정치(EPSILON) 반영된 조건판단
+    if not pos and (funding_rate + EPSILON) >= MIN_FUNDING_RATE and (funding_rate + EPSILON) >= ABSOLUTE_MIN_FUNDING:
         logging.info(f"🚀 {TARGET_COIN} 진입 조건 충족! (현재 펀딩비: {funding_rate*100:.4f}%)")
         await execute_delta_neutral_entry_async()
 
-    elif pos and funding_rate <= EXIT_FUNDING_RATE:
+    elif pos and (funding_rate - EPSILON) <= EXIT_FUNDING_RATE:
         logging.info(f"📉 {TARGET_COIN} 청산 조건 충족! (현재: {funding_rate*100:.4f}% <= 목표: {EXIT_FUNDING_RATE*100:.4f}%)")
         await execute_delta_neutral_exit_async("펀딩비 하락 청산")
 
@@ -861,7 +878,8 @@ async def main():
         f"• 상태 락(TRADING_LOCK) 도입으로 중복 주문 차단\n"
         f"• API Rate Limit 호환 (5초 주기 감시)\n"
         f"• 호가창 깊이 & ATR 변동성 리스크 필터링\n"
-        f"• TPSL 미등록 시 자동 청산 안전망 적용"
+        f"• TPSL 미등록 시 자동 청산 안전망 적용\n"
+        f"• 부동소수점 오차 보정 완료"
     )
 
     asyncio.create_task(periodic_log_reporter(application))
@@ -874,7 +892,6 @@ async def main():
             except Exception as e:
                 logging.error(f"매매 루프 오류: {e}")
 
-            # 🛡️ API Rate Limit 방어를 위한 5초 대기
             await asyncio.sleep(5)
             
     except (KeyboardInterrupt, SystemExit):
