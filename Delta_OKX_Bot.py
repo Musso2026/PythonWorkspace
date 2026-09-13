@@ -37,10 +37,6 @@ logging.basicConfig(
     ]
 )
 
-# 키 값 검증
-if not all([OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE]):
-    logging.error("❌ .env 파일에서 OKX API 키 정보를 찾을 수 없습니다. .env 파일을 확인해 주세요.")
-
 # ==========================================
 # 🛠️ OKX API 거래소 초기화
 # ==========================================
@@ -50,7 +46,7 @@ exchange = ccxt.okx({
     'password': OKX_PASSPHRASE,
     'enableRateLimit': True,
     'options': {
-        'defaultType': 'swap'  # 기본 타입을 무기한 선물로 지정
+        'defaultType': 'swap'
     }
 })
 
@@ -58,15 +54,15 @@ exchange = ccxt.okx({
 # 📲 텔레그램 알림 및 상태 관리
 # ==========================================
 def send_telegram_msg(message):
-    """텔레그램 메시지 전송"""
+    """텔레그램 메시지 전송 (예외 발생 시 봇 멈춤 방지)"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-        requests.post(url, json=payload, timeout=5)
+        requests.post(url, json=payload, timeout=3)  # 타임아웃 3초로 단축
     except Exception as e:
-        logging.error(f"텔레그램 메시지 전송 실패: {e}")
+        logging.warning(f"⚠️ 텔레그램 메시지 전송 실패 (무시하고 진행): {e}")
 
 def get_telegram_updates(last_update_id):
     """텔레그램 사용자 명령어 수신"""
@@ -75,7 +71,7 @@ def get_telegram_updates(last_update_id):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
         params = {"offset": last_update_id + 1, "timeout": 1}
-        res = requests.get(url, params=params, timeout=5).json()
+        res = requests.get(url, params=params, timeout=2).json()
         if res.get("ok"):
             return res.get("result", [])
     except Exception:
@@ -104,7 +100,6 @@ def fetch_top_funding_coin():
                     base_currency = swap_symbol.split('/')[0]
                     spot_symbol = f"{base_currency}/USDT"
                     
-                    # 현물 시세 조회
                     spot_ticker = tickers.get(spot_symbol)
                     if not spot_ticker:
                         continue
@@ -148,32 +143,28 @@ def validate_entry(data):
     return True
 
 # ==========================================
-# 🚀 주문 실행 (오류 자동 대응 적용)
+# 🚀 주문 실행
 # ==========================================
 def execute_entry(data):
-    """실제 주문 실행 (마진 부족 및 tdMode 예외 자동 처리)"""
+    """실제 주문 실행"""
     try:
         coin = data['coin']
         spot_symbol = data['spot_symbol']
         swap_symbol = data['swap_symbol']
         spot_price = data['spot_price']
 
-        # 마켓 메타데이터 로드
         markets = exchange.load_markets()
         swap_market = markets.get(swap_symbol, {})
         contract_size = float(swap_market.get('contractSize', 1.0))
 
-        # 1. 실시간 USDT 가능 잔고 조회
         balance = exchange.fetch_balance({'type': 'trading'})
         usdt_free = float(balance.get('USDT', {}).get('free', 0))
 
-        # 2. 거래 자본금(trade_capital) 결정 (안전 마진을 위해 잔고의 85% 사용)
         if TARGET_TRADE_AMOUNT and TARGET_TRADE_AMOUNT > 0:
             trade_capital = TARGET_TRADE_AMOUNT
         else:
             trade_capital = usdt_free * 0.85
 
-        # 최소 1계약 필요 금액 체크
         min_required_usd = spot_price * contract_size
         if usdt_free < min_required_usd:
             logging.error(f"❌ 잔고 부족: 최소 1계약 필요금액(${min_required_usd:.2f}) > 보유잔고(${usdt_free:.2f})")
@@ -183,7 +174,6 @@ def execute_entry(data):
         if trade_capital > usdt_free:
             trade_capital = usdt_free * 0.85
 
-        # 3. 계약 수량 계산
         raw_amount = trade_capital / spot_price
         swap_contracts = int(raw_amount / contract_size)
         if swap_contracts < 1:
@@ -191,13 +181,11 @@ def execute_entry(data):
 
         spot_amount = swap_contracts * contract_size
 
-        # 4. 레버리지 설정 (OKX 교차 모드)
         try:
             exchange.set_leverage(LEVERAGE, swap_symbol, params={'marginMode': 'cross'})
         except Exception as e:
             logging.warning(f"레버리지 설정 참고: {e}")
 
-        # 5. 선물 숏(Sell) 진입 (마진 부족 시 계약 수량 자동 차감 재시도)
         swap_order = None
         try:
             swap_order = exchange.create_market_sell_order(
@@ -207,7 +195,6 @@ def execute_entry(data):
             )
         except Exception as order_err:
             err_msg = str(order_err)
-            # 마진 부족(51008) 에러 발생 시 수량 1계약 차감 후 재시도
             if "51008" in err_msg or "available margin" in err_msg.lower():
                 if swap_contracts > 1:
                     swap_contracts -= 1
@@ -225,7 +212,6 @@ def execute_entry(data):
             else:
                 raise order_err
 
-        # 6. 현물 시장가 매수
         spot_order = exchange.create_market_buy_order(spot_symbol, spot_amount)
 
         used_usdt = spot_amount * spot_price
@@ -243,19 +229,17 @@ def execute_entry(data):
         return False
 
 def execute_exit(position):
-    """포지션 청산 (현물 매도 + 선물 숏 청산/매수)"""
+    """포지션 청산"""
     try:
         coin = position['coin']
         spot_symbol = position['spot_symbol']
         swap_symbol = position['swap_symbol']
 
-        # 1. 현물 전량 매도
         balance = exchange.fetch_balance()
         spot_amount = float(balance.get(coin, {}).get('free', 0))
         if spot_amount > 0:
             exchange.create_market_sell_order(spot_symbol, spot_amount)
 
-        # 2. 선물 숏 포지션 청산 (매수)
         positions = exchange.fetch_positions([swap_symbol])
         for pos in positions:
             contracts = float(pos.get('contracts', 0))
@@ -281,15 +265,16 @@ def execute_exit(position):
 # 🔄 메인 루프 (자동 매매)
 # ==========================================
 def main():
-    current_position = None  # 현재 보유 포지션 데이터
+    current_position = None
     last_update_id = 0
     global TARGET_TRADE_AMOUNT
 
+    # 로그 기록을 최우선 실행
+    logging.info("🤖 OKX 델타 뉴트럴 봇 프로세스가 시작되었습니다!")
     send_telegram_msg("🤖 OKX 델타 뉴트럴 봇이 성공적으로 시작되었습니다!")
 
     while True:
         try:
-            # 1. 텔레그램 원격 명령어 수신
             updates = get_telegram_updates(last_update_id)
             for update in updates:
                 last_update_id = update['update_id']
@@ -314,7 +299,6 @@ def main():
                     else:
                         send_telegram_msg("⚠️ 청산할 포지션이 없습니다.")
 
-            # 2. 보유 포지션 관리 및 청산 조건 감시
             if current_position:
                 funding_info = exchange.fetch_funding_rate(current_position['swap_symbol'])
                 current_rate = funding_info.get('fundingRate', 0)
@@ -326,8 +310,8 @@ def main():
                     if execute_exit(current_position):
                         current_position = None
 
-            # 3. 신규 진입 탐색 (포지션 없을 시)
             else:
+                logging.info("🔍 OKX 전체 코인 펀딩비 스캔을 시작합니다...")
                 best_data = fetch_top_funding_coin()
                 if best_data:
                     coin = best_data['coin']
