@@ -154,7 +154,7 @@ def validate_risk(spot_price, swap_price, funding_rate):
         return False, f"검증 내부 에러: {str(e)}", {}
 
 # ==========================================
-# 5. 멀티 코인 스캔 및 매매 실행 함수 (신규 보완)
+# 5. 멀티 코인 스캔 및 매매 실행 함수 (수정 반영 부분)
 # ==========================================
 def get_best_opportunity():
     """모니터링 대상 코인 중 가장 높은 펀딩비를 가진 코인을 탐색"""
@@ -192,25 +192,36 @@ def get_best_opportunity():
     return best_data
 
 def execute_entry(data):
-    """실제 주문 실행 (현물 매수 & 선물 숏)"""
+    """실제 주문 실행 (현물 매수 & 선물 숏 - tdMode 오류 수정 완)"""
     try:
         coin = data['coin']
         spot_symbol = data['spot_symbol']
         swap_symbol = data['swap_symbol']
         spot_price = data['spot_price']
 
-        # 1. 레버리지 설정
-        exchange.set_leverage(LEVERAGE, swap_symbol)
+        # 1. 레버리지 설정 (Cross 모드 지정)
+        try:
+            exchange.set_leverage(LEVERAGE, swap_symbol, params={'mgnMode': 'cross'})
+        except Exception as e:
+            logging.warning(f"레버리지 설정 경고 (이미 설정되어 있을 수 있음): {e}")
 
         # 2. 진입 수량 계산 (총 자본의 절반으로 현물/선물 각 진입)
         trade_capital = TOTAL_CAPITAL / 2
         amount = trade_capital / spot_price
 
-        # 3. 현물 시장가 매수
-        spot_order = exchange.create_market_buy_order(spot_symbol, amount)
+        # 3. 현물 시장가 매수 (tdMode: 'cash' 명시)
+        spot_order = exchange.create_market_buy_order(
+            spot_symbol, 
+            amount, 
+            params={'tdMode': 'cash'}
+        )
         
-        # 4. 선물 시장가 숏(Sell) 진입
-        swap_order = exchange.create_market_sell_order(swap_symbol, amount)
+        # 4. 선물 시장가 숏(Sell) 진입 (tdMode: 'cross' 명시)
+        swap_order = exchange.create_market_sell_order(
+            swap_symbol, 
+            amount, 
+            params={'tdMode': 'cross'}
+        )
 
         logging.info(f"✅ {coin} 실제 포지션 진입 성공! (수량: {amount:.4f})")
         send_telegram_msg(f"🚀 [{coin}] 델타 뉴트럴 포지션 진입 완료!\n- 펀딩비: {data['funding_rate']:.4f}%\n- 수량: {amount:.4f}")
@@ -221,24 +232,32 @@ def execute_entry(data):
         return False
 
 def execute_exit(coin):
-    """실제 포지션 청산 (선물 숏 닫기 & 현물 매도)"""
+    """실제 포지션 청산 (선물 숏 닫기 & 현물 매도 - tdMode 오류 수정 완)"""
     try:
         spot_symbol = f"{coin}/USDT"
         swap_symbol = f"{coin}/USDT:USDT"
 
-        # 1. 현물 잔고 조회 후 매도
+        # 1. 현물 잔고 조회 후 매도 (tdMode: 'cash' 명시)
         spot_balance = exchange.fetch_balance({'type': 'spot'})
         spot_amount = spot_balance['total'].get(coin, 0)
 
         if spot_amount > 0:
-            exchange.create_market_sell_order(spot_symbol, spot_amount)
+            exchange.create_market_sell_order(
+                spot_symbol, 
+                spot_amount, 
+                params={'tdMode': 'cash'}
+            )
 
-        # 2. 선물 포지션 잔고 조회 후 청산(Buy)
+        # 2. 선물 포지션 잔고 조회 후 청산(Buy) (tdMode: 'cross' 명시)
         positions = exchange.fetch_positions([swap_symbol])
         for pos in positions:
             pos_amount = float(pos.get('contracts', 0))
             if pos_amount > 0:
-                exchange.create_market_buy_order(swap_symbol, pos_amount)
+                exchange.create_market_buy_order(
+                    swap_symbol, 
+                    pos_amount, 
+                    params={'tdMode': 'cross'}
+                )
 
         logging.info(f"💡 {coin} 포지션 완벽 청산 완료!")
         send_telegram_msg(f"💡 [{coin}] 포지션 청산 완료!")
@@ -249,7 +268,7 @@ def execute_exit(coin):
         return False
 
 # ==========================================
-# 6. 메인 자동매매 루프
+# 6. 메인 자동매매 루프 (기존 코드 100% 유지)
 # ==========================================
 def main():
     global has_position, current_position_coin
