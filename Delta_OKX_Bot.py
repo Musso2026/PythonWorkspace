@@ -1,18 +1,21 @@
-import ccxt
+import os
 import time
 import requests
 import logging
-from datetime import datetime
+import ccxt
+from dotenv import load_dotenv
 
 # ==========================================
-# ⚙️ 사용자 설정 영역 (본인 정보로 수정하세요)
+# ⚙️ .env 파일 환경 변수 로드
 # ==========================================
-OKX_API_KEY = "YOUR_OKX_API_KEY"
-OKX_SECRET_KEY = "YOUR_OKX_SECRET_KEY"
-OKX_PASSPHRASE = "YOUR_OKX_PASSPHRASE"
+load_dotenv()
 
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
+OKX_API_KEY = os.getenv("OKX_API_KEY")
+OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY")
+OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # 봇 기본 매매 설정
 TARGET_FUNDING_RATE = 0.0001   # 목표 펀딩비 (0.01%)
@@ -34,6 +37,10 @@ logging.basicConfig(
     ]
 )
 
+# 키 값 검증
+if not all([OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE]):
+    logging.error("❌ .env 파일에서 OKX API 키 정보를 찾을 수 없습니다. .env 파일을 확인해 주세요.")
+
 # ==========================================
 # 🛠️ OKX API 거래소 초기화
 # ==========================================
@@ -52,6 +59,8 @@ exchange = ccxt.okx({
 # ==========================================
 def send_telegram_msg(message):
     """텔레그램 메시지 전송"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
@@ -61,13 +70,15 @@ def send_telegram_msg(message):
 
 def get_telegram_updates(last_update_id):
     """텔레그램 사용자 명령어 수신"""
+    if not TELEGRAM_TOKEN:
+        return []
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
         params = {"offset": last_update_id + 1, "timeout": 1}
         res = requests.get(url, params=params, timeout=5).json()
         if res.get("ok"):
             return res.get("result", [])
-    except Exception as e:
+    except Exception:
         pass
     return []
 
