@@ -7,7 +7,9 @@ import requests
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
-import ccxt
+
+# 🛡️ [최종 해결] CCXT에서 직접 okx 클래스 임포트
+from ccxt import okx, RateLimitExceeded
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -41,37 +43,14 @@ MAX_USDT_TOTAL = 3000.0
 GRID_PERCENT_SPACING = 0.002  # 0.2% 간격
 GRID_LEVELS = 3               
 
-# 🛡️ [최종 무결점 동적 객체 생성] CCXT 내부 맵핑 기반 생성 방식
-try:
-    if 'okx' in ccxt.exchanges:
-        exchange_class = getattr(ccxt, 'okx')
-        exchange = exchange_class({
-            'apiKey': OKX_API_KEY,
-            'secret': OKX_SECRET_KEY,
-            'password': OKX_PASSWORD,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'swap'}
-        })
-    else:
-        # 백업 방식: 범용 Exchange 클래스에 id 부여
-        exchange = ccxt.Exchange({
-            'id': 'okx',
-            'apiKey': OKX_API_KEY,
-            'secret': OKX_SECRET_KEY,
-            'password': OKX_PASSWORD,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'swap'}
-        })
-except Exception as e:
-    # 최종 안전망
-    exchange = ccxt.Exchange({
-        'id': 'okx',
-        'apiKey': OKX_API_KEY,
-        'secret': OKX_SECRET_KEY,
-        'password': OKX_PASSWORD,
-        'enableRateLimit': True,
-        'options': {'defaultType': 'swap'}
-    })
+# 🛡️ [직접 클래스 생성] 가장 확실한 초기화 방식
+exchange = okx({
+    'apiKey': OKX_API_KEY,
+    'secret': OKX_SECRET_KEY,
+    'password': OKX_PASSWORD,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'swap'}
+})
 
 def get_fear_and_greed_index():
     try:
@@ -210,7 +189,7 @@ async def execute_ultra_fast_scalping(symbol, allocated_usdt):
             exchange.create_order(symbol, 'limit', 'buy', buy_amount, buy_price)
             exchange.create_order(symbol, 'limit', 'sell', sell_amount, sell_price)
             
-    except ccxt.RateLimitExceeded:
+    except RateLimitExceeded:
         logger.warning("⚠️ 레이트 리밋 감지 - 1초 대기")
         await asyncio.sleep(1.0)
     except Exception as e:
