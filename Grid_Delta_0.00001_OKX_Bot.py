@@ -41,14 +41,37 @@ MAX_USDT_TOTAL = 3000.0
 GRID_PERCENT_SPACING = 0.002  # 0.2% 간격
 GRID_LEVELS = 3               
 
-# 🛡️ [완벽 해결] CCXT 공식 표준 okx 객체 생성 (가장 안전한 방식)
-exchange = ccxt.okx({
-    'apiKey': OKX_API_KEY,
-    'secret': OKX_SECRET_KEY,
-    'password': OKX_PASSWORD,
-    'enableRateLimit': True,
-    'options': {'defaultType': 'swap'}
-})
+# 🛡️ [최종 무결점 동적 객체 생성] CCXT 내부 맵핑 기반 생성 방식
+try:
+    if 'okx' in ccxt.exchanges:
+        exchange_class = getattr(ccxt, 'okx')
+        exchange = exchange_class({
+            'apiKey': OKX_API_KEY,
+            'secret': OKX_SECRET_KEY,
+            'password': OKX_PASSWORD,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'swap'}
+        })
+    else:
+        # 백업 방식: 범용 Exchange 클래스에 id 부여
+        exchange = ccxt.Exchange({
+            'id': 'okx',
+            'apiKey': OKX_API_KEY,
+            'secret': OKX_SECRET_KEY,
+            'password': OKX_PASSWORD,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'swap'}
+        })
+except Exception as e:
+    # 최종 안전망
+    exchange = ccxt.Exchange({
+        'id': 'okx',
+        'apiKey': OKX_API_KEY,
+        'secret': OKX_SECRET_KEY,
+        'password': OKX_PASSWORD,
+        'enableRateLimit': True,
+        'options': {'defaultType': 'swap'}
+    })
 
 def get_fear_and_greed_index():
     try:
