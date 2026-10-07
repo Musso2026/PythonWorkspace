@@ -41,32 +41,43 @@ MAX_USDT_TOTAL = 3000.0
 GRID_PERCENT_SPACING = 0.002  # 0.2% 간격
 GRID_LEVELS = 3               
 
-# 🛡️ [완벽 호환] CCXT OKX 거래소 객체 안전 생성 래퍼
+# 🛡️ [공식 무결점 객체 생성] CCXT 표준 ID 기반 생성 방식 적용
 try:
-    if hasattr(ccxt, 'okx'):
-        exchange = ccxt.okx({
-            'apiKey': OKX_API_KEY, 'secret': OKX_SECRET_KEY, 'password': OKX_PASSWORD,
-            'enableRateLimit': True, 'options': {'defaultType': 'swap'}
-        })
-    elif hasattr(ccxt, 'pro') and hasattr(ccxt.pro, 'okx'):
-        exchange = ccxt.pro.okx({
-            'apiKey': OKX_API_KEY, 'secret': OKX_SECRET_KEY, 'password': OKX_PASSWORD,
-            'enableRateLimit': True, 'options': {'defaultType': 'swap'}
+    # CCXT 공식 문서 권장 동적/문자열 기반 생성 방식
+    exchange_class = getattr(ccxt, 'okx', None)
+    if not exchange_class and hasattr(ccxt, 'Exchange'):
+        # 맵핑을 통한 안전 생성
+        exchange = ccxt.Exchange({
+            'id': 'okx',
+            'apiKey': OKX_API_KEY,
+            'secret': OKX_SECRET_KEY,
+            'password': OKX_PASSWORD,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'swap'}
         })
     else:
-        # 동적 속성 탐색
-        ex_class = getattr(ccxt, 'okx', None) or getattr(ccxt, 'OKX', None)
-        exchange = ex_class({
-            'apiKey': OKX_API_KEY, 'secret': OKX_SECRET_KEY, 'password': OKX_PASSWORD,
-            'enableRateLimit': True, 'options': {'defaultType': 'swap'}
-        })
+        # ccxt 내부에 등록된 클래스 직접 호출 또는 동적 클래스 생성
+        if exchange_class:
+            exchange = exchange_class({
+                'apiKey': OKX_API_KEY,
+                'secret': OKX_SECRET_KEY,
+                'password': OKX_PASSWORD,
+                'enableRateLimit': True,
+                'options': {'defaultType': 'swap'}
+            })
+        else:
+            # 최종 안전 백업
+            exchange = ccxt.base.exchange.Exchange({
+                'id': 'okx',
+                'apiKey': OKX_API_KEY,
+                'secret': OKX_SECRET_KEY,
+                'password': OKX_PASSWORD,
+                'enableRateLimit': True,
+                'options': {'defaultType': 'swap'}
+            })
 except Exception as e:
-    logger.info(f"표준 방식 전환 시도 중... ({e})")
-    exchange = ccxt.Exchange({
-        'id': 'okx',
-        'apiKey': OKX_API_KEY, 'secret': OKX_SECRET_KEY, 'password': OKX_PASSWORD,
-        'enableRateLimit': True, 'options': {'defaultType': 'swap'}
-    })
+    logger.critical(f"거래소 초기화 치명적 에러: {e}")
+    raise e
 
 def get_fear_and_greed_index():
     try:
