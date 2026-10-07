@@ -26,7 +26,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "")
 
-# 전역 제어 변수 (마스터피스 핵심 기능 유지)
+# 전역 제어 변수
 BOT_RUNNING = False
 LEVERAGE = 3
 MIN_FUNDING_RATE = 0.01  # 0.01%
@@ -41,26 +41,14 @@ MAX_USDT_TOTAL = 3000.0
 GRID_PERCENT_SPACING = 0.002  # 0.2% 간격
 GRID_LEVELS = 3               
 
-# 🛡️ [무결점 안전 객체 생성] 애트리뷰트 에러 원천 차단
-try:
-    okx_class = getattr(ccxt, 'okx', None)
-    if not okx_class:
-        okx_class = ccxt.Exchange
-        
-    exchange = okx_class({
-        'apiKey': OKX_API_KEY,
-        'secret': OKX_SECRET_KEY,
-        'password': OKX_PASSWORD,
-        'enableRateLimit': True,
-        'options': {'defaultType': 'swap'}
-    })
-    # 만약 Exchange 제네릭 클래스로 생성된 경우 명시적 ID 부여
-    if hasattr(exchange, 'id') and exchange.id != 'okx':
-        exchange.id = 'okx'
-        exchange.hostname = 'okx.com'
-except Exception as e:
-    logger.critical(f"거래소 초기화 치명적 에러: {e}")
-    raise e
+# 가장 확실하고 표준적인 OKX 거래소 객체 생성
+exchange = ccxt.okx({
+    'apiKey': OKX_API_KEY,
+    'secret': OKX_SECRET_KEY,
+    'password': OKX_PASSWORD,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'swap'}
+})
 
 def get_fear_and_greed_index():
     try:
@@ -166,7 +154,7 @@ def close_all_positions():
         for pos in positions:
             if float(pos['contracts']) > 0:
                 symbol = pos['symbol']
-                if symbol.replace(':USDT', '') not in ['ONDO/USDT']: # ONDO 자산 보호 철저 유지
+                if symbol.replace(':USDT', '') not in ['ONDO/USDT']:
                     side = 'sell' if pos['side'] == 'long' else 'buy'
                     exchange.create_order(symbol, 'market', side, pos['contracts'])
         logger.info("포지션 안전 청산 완료 (ONDO 보호됨)")
@@ -321,7 +309,7 @@ async def telegram_heartbeat_job(application):
                     f"- 가용 자금: `{usdt_free:,.2f} USDT`\n"
                     f"- 평가 손익: `{total_unrealized_pnl:+.2f} USDT` (약 `{total_pnl_krw:+,.0f} 원`)\n\n"
                     f"📊 **[타겟 코인]** {', '.join(SELECTED_COINS) if SELECTED_COINS else '없음'}\n"
-                    f"🔒 **보호 자산**: ONDO (안전 격리)"
+                    f"🔒 **보호 자산**: ONDO"
                 )
                 await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
             except Exception as e:
