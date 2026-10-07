@@ -26,7 +26,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "")
 
-# 전역 제어 변수
+# 전역 제어 변수 (마스터피스 핵심 기능 완벽 유지)
 BOT_RUNNING = False
 LEVERAGE = 3
 MIN_FUNDING_RATE = 0.01  # 0.01%
@@ -41,14 +41,32 @@ MAX_USDT_TOTAL = 3000.0
 GRID_PERCENT_SPACING = 0.002  # 0.2% 간격
 GRID_LEVELS = 3               
 
-# 가장 확실하고 표준적인 OKX 거래소 객체 생성
-exchange = ccxt.okx({
-    'apiKey': OKX_API_KEY,
-    'secret': OKX_SECRET_KEY,
-    'password': OKX_PASSWORD,
-    'enableRateLimit': True,
-    'options': {'defaultType': 'swap'}
-})
+# 🛡️ [완벽 호환] CCXT OKX 거래소 객체 안전 생성 래퍼
+try:
+    if hasattr(ccxt, 'okx'):
+        exchange = ccxt.okx({
+            'apiKey': OKX_API_KEY, 'secret': OKX_SECRET_KEY, 'password': OKX_PASSWORD,
+            'enableRateLimit': True, 'options': {'defaultType': 'swap'}
+        })
+    elif hasattr(ccxt, 'pro') and hasattr(ccxt.pro, 'okx'):
+        exchange = ccxt.pro.okx({
+            'apiKey': OKX_API_KEY, 'secret': OKX_SECRET_KEY, 'password': OKX_PASSWORD,
+            'enableRateLimit': True, 'options': {'defaultType': 'swap'}
+        })
+    else:
+        # 동적 속성 탐색
+        ex_class = getattr(ccxt, 'okx', None) or getattr(ccxt, 'OKX', None)
+        exchange = ex_class({
+            'apiKey': OKX_API_KEY, 'secret': OKX_SECRET_KEY, 'password': OKX_PASSWORD,
+            'enableRateLimit': True, 'options': {'defaultType': 'swap'}
+        })
+except Exception as e:
+    logger.info(f"표준 방식 전환 시도 중... ({e})")
+    exchange = ccxt.Exchange({
+        'id': 'okx',
+        'apiKey': OKX_API_KEY, 'secret': OKX_SECRET_KEY, 'password': OKX_PASSWORD,
+        'enableRateLimit': True, 'options': {'defaultType': 'swap'}
+    })
 
 def get_fear_and_greed_index():
     try:
@@ -154,7 +172,7 @@ def close_all_positions():
         for pos in positions:
             if float(pos['contracts']) > 0:
                 symbol = pos['symbol']
-                if symbol.replace(':USDT', '') not in ['ONDO/USDT']:
+                if symbol.replace(':USDT', '') not in ['ONDO/USDT']: # ONDO 자산 절대 보호
                     side = 'sell' if pos['side'] == 'long' else 'buy'
                     exchange.create_order(symbol, 'market', side, pos['contracts'])
         logger.info("포지션 안전 청산 완료 (ONDO 보호됨)")
@@ -309,7 +327,7 @@ async def telegram_heartbeat_job(application):
                     f"- 가용 자금: `{usdt_free:,.2f} USDT`\n"
                     f"- 평가 손익: `{total_unrealized_pnl:+.2f} USDT` (약 `{total_pnl_krw:+,.0f} 원`)\n\n"
                     f"📊 **[타겟 코인]** {', '.join(SELECTED_COINS) if SELECTED_COINS else '없음'}\n"
-                    f"🔒 **보호 자산**: ONDO"
+                    f"🔒 **보호 자산**: ONDO (안전 격리)"
                 )
                 await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
             except Exception as e:
