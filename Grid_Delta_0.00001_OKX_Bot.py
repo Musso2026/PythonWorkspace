@@ -7,7 +7,7 @@ import requests
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
-import ccxt.async_support as ccxt
+import ccxt.async_support as ccxt_async  # 비동기 전용 모듈 명확히 분리
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -26,22 +26,23 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "")
 
-# 전역 제어 변수 (텔레그램을 통해 실시간 변경 가능)
+# 전역 제어 변수
 BOT_RUNNING = False
 LEVERAGE = 3
 MIN_FUNDING_RATE = 0.01  # 0.01%
 SELECTED_COINS = []
-LAST_NOTIFIED_POSITIONS = set() # 실시간 거래 알림 중복 방지용
+LAST_NOTIFIED_POSITIONS = set()
 
 # 자금 제어 규칙 (코인당 최대 750 USDT, 4개 동시 진입 시 최대 3000 USDT)
 MAX_USDT_PER_COIN = 750.0
 MAX_USDT_TOTAL = 3000.0
 
-# 초단타 그리드 세부 설정 (초고속 스캘핑 스프레드)
+# 초단타 그리드 세부 설정
 GRID_PERCENT_SPACING = 0.002  # 0.2% 간격 촘촘한 격자
 GRID_LEVELS = 3               
 
-exchange = ccxt.okx({
+# CCXT 공식 표준 비동기 OKX 거래소 객체 생성 방식 적용
+exchange = ccxt_async.okx({
     'apiKey': OKX_API_KEY,
     'secret': OKX_SECRET_KEY,
     'password': OKX_PASSWORD,
@@ -64,7 +65,7 @@ def get_krw_rate():
     except:
         return 1350.0
 
-# ==================== 실시간 뉴스 및 정치/경제 감성 분석 ====================
+# 실시간 뉴스 및 정치/경제 감성 분석
 def get_news_sentiment_score(coin_symbol=""):
     try:
         base_currency = coin_symbol.split('/')[0] if coin_symbol else ""
@@ -91,10 +92,6 @@ def get_news_sentiment_score(coin_symbol=""):
         return 0
 
 async def dynamic_coin_screening():
-    """
-    무조건 3~4개를 잡지 않고, 시장 상황과 점수에 따라 
-    기회가 좋은 1개 또는 2개, 최대 4개까지 유동적으로 코인 선정
-    """
     global SELECTED_COINS
     try:
         logger.info("스마트 동적 코인 스크리닝 시작 (1~4개 유동적 선정)...")
@@ -104,7 +101,6 @@ async def dynamic_coin_screening():
         fng_score = get_fear_and_greed_index()
         scored_coins = []
         
-        # 레이트 리밋 방지를 위해 상위 15개만 빠르게 평가
         for symbol in symbols[:15]:
             try:
                 ohlcv = await exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
@@ -113,22 +109,18 @@ async def dynamic_coin_screening():
                 volatility = df['close'].pct_change().std() * 100
                 news_score = get_news_sentiment_score(symbol)
                 
-                # 종합 점수 산출
                 total_score = (volatility * 0.6) + (news_score * 0.4)
-                if total_score > 1.5:  # 충분한 변동성과 호재가 있는 코인만 필터링
+                if total_score > 1.5:
                     scored_coins.append((symbol, total_score))
             except:
                 continue
                 
         scored_coins.sort(key=lambda x: x[1], reverse=True)
         
-        # 시장 상황(공포탐욕지수 및 점수 분포)에 따라 1개~4개 동적 결정
         if fng_score < 30 or len(scored_coins) == 0:
-            # 장이 안 좋거나 기회가 없으면 확실한 대장주 1~2개만 타이트하게 공략
             target_count = min(2, len(scored_coins)) if len(scored_coins) > 0 else 1
             SELECTED_COINS = [item[0] for item in scored_coins[:target_count]] if target_count > 0 else ['BTC/USDT:USDT']
         else:
-            # 장이 좋을 때 최대 4개까지 유동적 확장
             target_count = max(1, min(4, len(scored_coins)))
             SELECTED_COINS = [item[0] for item in scored_coins[:target_count]]
             
@@ -137,13 +129,11 @@ async def dynamic_coin_screening():
         logger.error(f"스크리닝 오류: {e}")
         SELECTED_COINS = ['BTC/USDT:USDT']
 
-# ==================== 1순위: 킬스위치 및 돌발 상황 헷지 대처 ====================
 async def check_global_kill_switch(application=None):
     try:
         balance = await exchange.fetch_balance()
         margin_ratio = float(balance.get('info', {}).get('mrgRatio', 0) or 0)
         
-        # 증거금 위험(0.75 이상) 또는 급격한 손실 발생 시 돌발 상황 대처 (긴급 청산)
         if margin_ratio > 0.75:
             logger.critical("⚠️ [돌발 상황 감지] 마진 위험율 초과! 모든 포지션 긴급 청산 및 봇 비상 정지")
             await close_all_positions()
@@ -165,7 +155,6 @@ async def close_all_positions():
         for pos in positions:
             if float(pos['contracts']) > 0:
                 symbol = pos['symbol']
-                # 사용자가 수동 보유 중인 ONDO 등 자산은 철저히 보호
                 if symbol.replace(':USDT', '') not in ['ONDO/USDT']:
                     side = 'sell' if pos['side'] == 'long' else 'buy'
                     await exchange.create_order(symbol, 'market', side, pos['contracts'])
@@ -173,20 +162,13 @@ async def close_all_positions():
     except Exception as e:
         logger.error(f"긴급 청산 실패: {e}")
 
-# ==================== 초고속 비동기 스캘핑 그리드 엔진 (0.00001초 극한 속도 + 레이트 리밋 방어) ====================
 async def execute_ultra_fast_scalping(symbol, allocated_usdt):
-    """
-    레이트 리밋(Rate Limit) 방어와 0.00001초 수준의 빠른 처리를 위해 
-    주문 최적화 캐싱 및 에러 핸들링을 탑재한 초고속 스캘핑 엔진
-    """
     try:
-        # ccxt 내부 레이트 리밋 보호를 준수하며 고속 호가 조회
         ticker = await exchange.fetch_ticker(symbol)
         current_price = ticker['last']
         
         try:
             open_orders = await exchange.fetch_open_orders(symbol)
-            # 기존 주문이 너무 잦게 바뀌어 API 과부하가 걸리지 않도록 가격 변동이 미미하면 스킵
             if len(open_orders) >= (GRID_LEVELS * 2):
                 return
             for order in open_orders:
@@ -196,7 +178,6 @@ async def execute_ultra_fast_scalping(symbol, allocated_usdt):
 
         per_grid_amount = (allocated_usdt * LEVERAGE) / GRID_LEVELS
         
-        # 비동기로 상하한 지정가 주문을 동시에 타전하여 체결 속도 극대화
         order_tasks = []
         for i in range(1, GRID_LEVELS + 1):
             buy_price = current_price * (1 - (GRID_PERCENT_SPACING * i))
@@ -209,13 +190,12 @@ async def execute_ultra_fast_scalping(symbol, allocated_usdt):
             order_tasks.append(exchange.create_order(symbol, 'limit', 'sell', sell_amount, sell_price))
             
         await asyncio.gather(*order_tasks, return_exceptions=True)
-    except ccxt.RateLimitExceeded:
-        logger.warning("⚠️ 거래소 API 레이트 리밋 감지 - 1초 동안 스마트 스로틀링 대기")
+    except ccxt_async.RateLimitExceeded:
+        logger.warning("⚠️ 거래소 API 레이트 리밋 감지 - 1초 대기")
         await asyncio.sleep(1.0)
     except Exception as e:
         logger.error(f"[{symbol}] 초고속 스캘핑 집행 에러: {e}")
 
-# ==================== 메인 통합 트레이딩 루프 ====================
 async def trading_bot_loop(application=None):
     global BOT_RUNNING
     logger.info("초고속 스캘핑 통합 트레이딩 루프 시작됨")
@@ -227,11 +207,9 @@ async def trading_bot_loop(application=None):
             continue
             
         try:
-            # 1. 킬스위치 및 돌발 상황 헷지 상시 감시
             if await check_global_kill_switch(application):
                 break
                 
-            # 2. 10사이클(약 30초~1분)마다 시장 상황에 맞춰 코인 동적 재스크리닝
             if screening_counter <= 0 or not SELECTED_COINS:
                 await dynamic_coin_screening()
                 screening_counter = 10
@@ -240,14 +218,11 @@ async def trading_bot_loop(application=None):
 
             balance = await exchange.fetch_balance()
             usdt_total = balance['USDT']['total']
-            krw_rate = get_krw_rate()
-
-            # 원금 상관없이, 코인당 최대 750 USDT, 4개 동시 진입 시 최대 3000 USDT 내에서 배분
+            
             num_coins = max(1, len(SELECTED_COINS))
             target_total_allocation = min(MAX_USDT_TOTAL, usdt_total)
             allocated_usdt_per_coin = min(MAX_USDT_PER_COIN, target_total_allocation / num_coins)
 
-            # 비동기로 모든 타겟 코인에 대해 초고속 스캘핑 주문 동시 집행 (속도 극대화)
             scalping_tasks = []
             for symbol in SELECTED_COINS:
                 funding_info = await exchange.fetch_funding_rate(symbol)
@@ -266,18 +241,15 @@ async def trading_bot_loop(application=None):
             if scalping_tasks:
                 await asyncio.gather(*scalping_tasks, return_exceptions=True)
 
-            # 실시간 거래 발생 시 즉시 텔레그램 알림 브리핑 체크
             if application and TELEGRAM_CHAT_ID:
                 await check_and_send_realtime_trade_alerts(application)
 
-            # 잦은 API 에러 방지 및 초고속 루프 최적화 미세 대기 (3초 간격)
             await asyncio.sleep(3)
 
         except Exception as e:
             logger.error(f"메인 루프 예외 발생: {e}")
             await asyncio.sleep(2)
 
-# ==================== 실시간 개별 거래 및 수익률 텔레그램 브리핑 ====================
 async def check_and_send_realtime_trade_alerts(application):
     global LAST_NOTIFIED_POSITIONS
     try:
@@ -289,7 +261,7 @@ async def check_and_send_realtime_trade_alerts(application):
             contracts = float(pos.get('contracts', 0) or 0)
             if contracts > 0:
                 symbol = pos['symbol']
-                if symbol.replace(':USDT', '') in ['ONDO/USDT']: continue # 수동 보유 제외
+                if symbol.replace(':USDT', '') in ['ONDO/USDT']: continue
                 
                 active_symbols.add(symbol)
                 entry_price = float(pos.get('entryPrice', 0) or 0)
@@ -297,7 +269,6 @@ async def check_and_send_realtime_trade_alerts(application):
                 pnl = float(pos.get('unrealizedPnl', 0) or 0)
                 side = pos.get('side', 'long').upper()
                 
-                # 수익률(ROE 또는 가격 기준 변동률) 계산
                 roe = 0
                 if entry_price > 0:
                     if side == 'LONG':
@@ -307,7 +278,6 @@ async def check_and_send_realtime_trade_alerts(application):
 
                 pnl_krw = pnl * krw_rate
                 
-                # 새로운 거래 진입이 감지되었거나 상태가 바뀐 경우 즉시 텔레그램 실시간 알림 전송
                 if symbol not in LAST_NOTIFIED_POSITIONS:
                     msg = (
                         f"🚨 **[실시간 코인 거래 체결 알림]**\n"
@@ -324,10 +294,9 @@ async def check_and_send_realtime_trade_alerts(application):
     except Exception as e:
         logger.error(f"실시간 거래 알림 에러: {e}")
 
-# ==================== 30분 정기 헬스체크 및 총 투자 원금/수익 브리핑 ====================
 async def telegram_heartbeat_job(application):
     while True:
-        await asyncio.sleep(1800) # 30분 마다
+        await asyncio.sleep(1800)
         if TELEGRAM_CHAT_ID and BOT_RUNNING:
             try:
                 balance = await exchange.fetch_balance()
@@ -336,7 +305,6 @@ async def telegram_heartbeat_job(application):
                 krw_rate = get_krw_rate()
                 total_krw = usdt_total * krw_rate
                 
-                # 총 미실현 수익 계산
                 positions = await exchange.fetch_positions()
                 total_unrealized_pnl = sum([float(p.get('unrealizedPnl', 0) or 0) for p in positions if float(p.get('contracts', 0) or 0) > 0])
                 total_pnl_krw = total_unrealized_pnl * krw_rate
@@ -355,7 +323,6 @@ async def telegram_heartbeat_job(application):
             except Exception as e:
                 logger.error(f"헬스체크 오류: {e}")
 
-# ==================== 텔레그램 명령어 제어 핸들러 ====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID): return
     global BOT_RUNNING
@@ -418,7 +385,7 @@ async def main():
     
     await app.initialize()
     await app.start()
-    await app.updater.start_polling()
+    app.updater.start_polling()
     
     asyncio.create_task(trading_bot_loop(app))
     asyncio.create_task(telegram_heartbeat_job(app))
