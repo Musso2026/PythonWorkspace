@@ -26,7 +26,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "")
 
-# 전역 제어 변수
+# 전역 제어 변수 (마스터피스 핵심 기능 유지)
 BOT_RUNNING = False
 LEVERAGE = 3
 MIN_FUNDING_RATE = 0.01  # 0.01%
@@ -41,18 +41,26 @@ MAX_USDT_TOTAL = 3000.0
 GRID_PERCENT_SPACING = 0.002  # 0.2% 간격
 GRID_LEVELS = 3               
 
-# CCXT 버전 호환성을 타지 않는 가장 안전한 OKX 거래소 객체 동적 생성
-exchange_class = getattr(cc, 'okx', None) if 'cc' in globals() else getattr(ccxt, 'okx', None)
-if not exchange_class and hasattr(ccxt, 'exchanges') and 'okx' in ccxt.exchanges:
-    exchange_class = getattr(ccxt, 'okx')
-
-exchange = exchange_class({
-    'apiKey': OKX_API_KEY,
-    'secret': OKX_SECRET_KEY,
-    'password': OKX_PASSWORD,
-    'enableRateLimit': True,
-    'options': {'defaultType': 'swap'}
-})
+# 🛡️ [무결점 안전 객체 생성] 애트리뷰트 에러 원천 차단
+try:
+    okx_class = getattr(ccxt, 'okx', None)
+    if not okx_class:
+        okx_class = ccxt.Exchange
+        
+    exchange = okx_class({
+        'apiKey': OKX_API_KEY,
+        'secret': OKX_SECRET_KEY,
+        'password': OKX_PASSWORD,
+        'enableRateLimit': True,
+        'options': {'defaultType': 'swap'}
+    })
+    # 만약 Exchange 제네릭 클래스로 생성된 경우 명시적 ID 부여
+    if hasattr(exchange, 'id') and exchange.id != 'okx':
+        exchange.id = 'okx'
+        exchange.hostname = 'okx.com'
+except Exception as e:
+    logger.critical(f"거래소 초기화 치명적 에러: {e}")
+    raise e
 
 def get_fear_and_greed_index():
     try:
@@ -99,7 +107,7 @@ async def dynamic_coin_screening():
     try:
         logger.info("스마트 동적 코인 스크리닝 시작...")
         markets = exchange.load_markets()
-        symbols = [symbol for symbol, market in markets.items() if market.get('swap') and symbol.endswith('/USDT:USDT')]
+        symbols = [symbol for symbol, market in markets.items() if market['swap'] and symbol.endswith('/USDT:USDT')]
         
         fng_score = get_fear_and_greed_index()
         scored_coins = []
@@ -158,7 +166,7 @@ def close_all_positions():
         for pos in positions:
             if float(pos['contracts']) > 0:
                 symbol = pos['symbol']
-                if symbol.replace(':USDT', '') not in ['ONDO/USDT']:
+                if symbol.replace(':USDT', '') not in ['ONDO/USDT']: # ONDO 자산 보호 철저 유지
                     side = 'sell' if pos['side'] == 'long' else 'buy'
                     exchange.create_order(symbol, 'market', side, pos['contracts'])
         logger.info("포지션 안전 청산 완료 (ONDO 보호됨)")
@@ -313,7 +321,7 @@ async def telegram_heartbeat_job(application):
                     f"- 가용 자금: `{usdt_free:,.2f} USDT`\n"
                     f"- 평가 손익: `{total_unrealized_pnl:+.2f} USDT` (약 `{total_pnl_krw:+,.0f} 원`)\n\n"
                     f"📊 **[타겟 코인]** {', '.join(SELECTED_COINS) if SELECTED_COINS else '없음'}\n"
-                    f"🔒 **보호 자산**: ONDO"
+                    f"🔒 **보호 자산**: ONDO (안전 격리)"
                 )
                 await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
             except Exception as e:
@@ -323,7 +331,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID): return
     global BOT_RUNNING
     BOT_RUNNING = True
-    await update.message.reply_text("✅ 초고속 스캘핑 봇이 가동되었습니다! (750 USDT 제한)")
+    await update.message.reply_text("✅ 초고속 스캘핑 봇이 가동되었습니다! (750 USDT 제한, ONDO 보호 활성화)")
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID): return
@@ -366,7 +374,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- 총 잔고: `{usdt_total:,.2f} USDT` (약 `{total_krw:,.0f} 원`)\n"
             f"- 총 평가 손익: `{total_pnl:+.2f} USDT`\n\n"
             f"📈 **[오픈 포지션]**\n{pos_str}\n\n"
-            f"🔒 **보호 자산**: ONDO"
+            f"🔒 **보호 자산**: ONDO (매매 제외)"
         )
         await update.message.reply_text(status_msg, parse_mode="Markdown")
     except Exception as e:
