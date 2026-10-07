@@ -7,7 +7,7 @@ import requests
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
-import ccxt  # 가장 안정적인 동기/비동기 통합 표준 모듈 사용
+import ccxt
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -41,8 +41,12 @@ MAX_USDT_TOTAL = 3000.0
 GRID_PERCENT_SPACING = 0.002  # 0.2% 간격
 GRID_LEVELS = 3               
 
-# 가장 안정적인 표준 OKX 거래소 객체 생성
-exchange = ccxt.okx({
+# CCXT 버전 호환성을 타지 않는 가장 안전한 OKX 거래소 객체 동적 생성
+exchange_class = getattr(cc, 'okx', None) if 'cc' in globals() else getattr(ccxt, 'okx', None)
+if not exchange_class and hasattr(ccxt, 'exchanges') and 'okx' in ccxt.exchanges:
+    exchange_class = getattr(ccxt, 'okx')
+
+exchange = exchange_class({
     'apiKey': OKX_API_KEY,
     'secret': OKX_SECRET_KEY,
     'password': OKX_PASSWORD,
@@ -95,7 +99,7 @@ async def dynamic_coin_screening():
     try:
         logger.info("스마트 동적 코인 스크리닝 시작...")
         markets = exchange.load_markets()
-        symbols = [symbol for symbol, market in markets.items() if market['swap'] and symbol.endswith('/USDT:USDT')]
+        symbols = [symbol for symbol, market in markets.items() if market.get('swap') and symbol.endswith('/USDT:USDT')]
         
         fng_score = get_fear_and_greed_index()
         scored_coins = []
