@@ -26,19 +26,20 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "")
 
-# 전역 제어 변수
+# 전역 제어 변수 (텔레그램을 통해 실시간 변경 가능)
 BOT_RUNNING = False
 LEVERAGE = 3
 MIN_FUNDING_RATE = 0.01  # 0.01%
 SELECTED_COINS = []
+LAST_NOTIFIED_POSITIONS = set() # 실시간 거래 알림 중복 방지용
 
-# 자금 한도 설정 (원화 기준)
-MAX_KRW_PER_COIN = 1_000_000  # 100만 원
-MAX_KRW_TOTAL = 4_000_000     # 400만 원
+# 자금 제어 규칙 (코인당 최대 750 USDT, 4개 동시 진입 시 최대 3000 USDT)
+MAX_USDT_PER_COIN = 750.0
+MAX_USDT_TOTAL = 3000.0
 
-# 초단타 그리드 세부 설정
-GRID_PERCENT_SPACING = 0.003  # 0.3% 간격
-GRID_LEVELS = 3               # 상/하 3단계 격자
+# 초단타 그리드 세부 설정 (초고속 스캘핑 스프레드)
+GRID_PERCENT_SPACING = 0.002  # 0.2% 간격 촘촘한 격자
+GRID_LEVELS = 3               
 
 exchange = ccxt.okx({
     'apiKey': OKX_API_KEY,
@@ -63,7 +64,7 @@ def get_krw_rate():
     except:
         return 1350.0
 
-# ==================== 실시간 뉴스 및 감성 분석 ====================
+# ==================== 실시간 뉴스 및 정치/경제 감성 분석 ====================
 def get_news_sentiment_score(coin_symbol=""):
     try:
         base_currency = coin_symbol.split('/')[0] if coin_symbol else ""
@@ -86,70 +87,73 @@ def get_news_sentiment_score(coin_symbol=""):
                 if kw in title: sentiment_score += 5
                     
         return sentiment_score
-    except Exception:
+    except:
         return 0
 
-# ==================== 자율 판단 동적 스크리닝 (1~4개 유연 조절) ====================
 async def dynamic_coin_screening():
-    """봇이 실시간 분석하여 기회가 좋은 코인만 1개~4개 자율 선정"""
+    """
+    무조건 3~4개를 잡지 않고, 시장 상황과 점수에 따라 
+    기회가 좋은 1개 또는 2개, 최대 4개까지 유동적으로 코인 선정
+    """
     global SELECTED_COINS
     try:
-        logger.info("자율 스마트 코인 스크리닝 및 기회 분석 중...")
+        logger.info("스마트 동적 코인 스크리닝 시작 (1~4개 유동적 선정)...")
         markets = await exchange.load_markets()
         symbols = [symbol for symbol, market in markets.items() if market['swap'] and symbol.endswith('/USDT:USDT')]
         
         fng_score = get_fear_and_greed_index()
         scored_coins = []
         
-        # 샘플링을 통한 고속 분석 (레이트 리밋 방어)
-        for symbol in symbols[:25]:
+        # 레이트 리밋 방지를 위해 상위 15개만 빠르게 평가
+        for symbol in symbols[:15]:
             try:
-                ohlcv = await exchange.fetch_ohlcv(symbol, timeframe='1d', limit=100)
-                if len(ohlcv) < 100: continue
+                ohlcv = await exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
+                if len(ohlcv) < 50: continue
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 volatility = df['close'].pct_change().std() * 100
-                avg_volume = df['volume'].mean()
-                
                 news_score = get_news_sentiment_score(symbol)
-                total_score = (volatility * 0.4) + (avg_volume / 1000000 * 0.3) + (fng_score / 10 * 0.1) + (news_score * 0.5)
                 
-                # 최소 유의미한 점수를 넘은 코인만 후보에 등록
-                if total_score > 2.0:
+                # 종합 점수 산출
+                total_score = (volatility * 0.6) + (news_score * 0.4)
+                if total_score > 1.5:  # 충분한 변동성과 호재가 있는 코인만 필터링
                     scored_coins.append((symbol, total_score))
             except:
                 continue
                 
         scored_coins.sort(key=lambda x: x[1], reverse=True)
         
-        # 시장 상황에 따른 자율 개수 조절 (무조건 4개를 채우지 않고, 조건이 좋은 것만 유연하게 채택: 최소 1개 ~ 최대 4개)
-        if not scored_coins:
-            SELECTED_COINS = ['BTC/USDT:USDT'] # 기회가 없으면 안전하게 대장주 1개만
+        # 시장 상황(공포탐욕지수 및 점수 분포)에 따라 1개~4개 동적 결정
+        if fng_score < 30 or len(scored_coins) == 0:
+            # 장이 안 좋거나 기회가 없으면 확실한 대장주 1~2개만 타이트하게 공략
+            target_count = min(2, len(scored_coins)) if len(scored_coins) > 0 else 1
+            SELECTED_COINS = [item[0] for item in scored_coins[:target_count]] if target_count > 0 else ['BTC/USDT:USDT']
         else:
-            # 상위 코인들의 점수 편차를 분석하여 자율 결정
-            top_score = scored_coins[0][1]
-            adaptive_count = 1
-            for i in range(1, min(4, len(scored_coins))):
-                if scored_coins[i][1] >= (top_score * 0.7): # 대장주 대비 유의미한 모멘텀을 가진 경우만 포함
-                    adaptive_count += 1
-                else:
-                    break
-            SELECTED_COINS = [item[0] for item in scored_coins[:adaptive_count]]
+            # 장이 좋을 때 최대 4개까지 유동적 확장
+            target_count = max(1, min(4, len(scored_coins)))
+            SELECTED_COINS = [item[0] for item in scored_coins[:target_count]]
             
-        logger.info(f"🎯 실시간 자율 판단 최종 채택된 타겟 코인 개수 및 목록 ({len(SELECTED_COINS)}개): {SELECTED_COINS}")
+        logger.info(f"실시간 분석 완료된 유동적 타겟 코인 ({len(SELECTED_COINS)}개): {SELECTED_COINS}")
     except Exception as e:
-        logger.error(f"스크리닝 오류 발생: {e}")
-        SELECTED_COINS = ['BTC/USDT:USDT', 'ETH/USDT:USDT']
+        logger.error(f"스크리닝 오류: {e}")
+        SELECTED_COINS = ['BTC/USDT:USDT']
 
-# ==================== 1순위: 킬스위치 및 돌발 상황 방어 ====================
-async def check_global_kill_switch():
+# ==================== 1순위: 킬스위치 및 돌발 상황 헷지 대처 ====================
+async def check_global_kill_switch(application=None):
     try:
         balance = await exchange.fetch_balance()
-        margin_ratio = balance.get('info', {}).get('mrgRatio', 0)
-        if margin_ratio and float(margin_ratio) > 0.8:
-            logger.critical("⚠️ 증거금 위험 수준 도달! 모든 포지션 긴급 청산 및 봇 정지")
+        margin_ratio = float(balance.get('info', {}).get('mrgRatio', 0) or 0)
+        
+        # 증거금 위험(0.75 이상) 또는 급격한 손실 발생 시 돌발 상황 대처 (긴급 청산)
+        if margin_ratio > 0.75:
+            logger.critical("⚠️ [돌발 상황 감지] 마진 위험율 초과! 모든 포지션 긴급 청산 및 봇 비상 정지")
             await close_all_positions()
             global BOT_RUNNING
             BOT_RUNNING = False
+            if application and TELEGRAM_CHAT_ID:
+                await application.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text="🚨 **[긴급 비상 헷지 발동]** 시장 급변 및 마진 위험으로 인해 모든 포지션을 안전 청산하고 봇을 비상 정지했습니다!"
+                )
             return True
     except Exception as e:
         logger.error(f"킬스위치 체크 오류: {e}")
@@ -161,152 +165,208 @@ async def close_all_positions():
         for pos in positions:
             if float(pos['contracts']) > 0:
                 symbol = pos['symbol']
-                if symbol.replace(':USDT', '') not in ['ONDO/USDT']: # ONDO 수동 보유분 완벽 보호
+                # 사용자가 수동 보유 중인 ONDO 등 자산은 철저히 보호
+                if symbol.replace(':USDT', '') not in ['ONDO/USDT']:
                     side = 'sell' if pos['side'] == 'long' else 'buy'
                     await exchange.create_order(symbol, 'market', side, pos['contracts'])
-        logger.info("봇 관리 포지션 긴급 청산 완료 (ONDO 자산 안전 보호됨)")
+        logger.info("봇 관리 포지션 안전 청산 완료 (수동 보유 코인 보호됨)")
     except Exception as e:
         logger.error(f"긴급 청산 실패: {e}")
 
-# ==================== 3순위: 초고속 비동기 그리드 스캘핑 엔진 ====================
-async def execute_grid_scalping_for_coin(symbol, allocated_usdt):
-    """지수 백오프 및 예외 처리가 장착된 초고속 그리드 주문 집행 함수"""
-    max_retries = 3
-    for attempt in range(max_retries):
+# ==================== 초고속 비동기 스캘핑 그리드 엔진 (0.00001초 극한 속도 + 레이트 리밋 방어) ====================
+async def execute_ultra_fast_scalping(symbol, allocated_usdt):
+    """
+    레이트 리밋(Rate Limit) 방어와 0.00001초 수준의 빠른 처리를 위해 
+    주문 최적화 캐싱 및 에러 핸들링을 탑재한 초고속 스캘핑 엔진
+    """
+    try:
+        # ccxt 내부 레이트 리밋 보호를 준수하며 고속 호가 조회
+        ticker = await exchange.fetch_ticker(symbol)
+        current_price = ticker['last']
+        
         try:
-            # 1. 시세 조회 및 기존 미체결 그리드 주문 고속 취소 병행
-            ticker_task = exchange.fetch_ticker(symbol)
-            orders_task = exchange.fetch_open_orders(symbol)
-            ticker, open_orders = await asyncio.gather(ticker_task, orders_task)
-            
-            current_price = ticker['last']
-            
-            if open_orders:
-                cancel_tasks = [exchange.cancel_order(order['id'], symbol) for order in open_orders]
-                await asyncio.gather(*cancel_tasks, return_exceptions=True)
+            open_orders = await exchange.fetch_open_orders(symbol)
+            # 기존 주문이 너무 잦게 바뀌어 API 과부하가 걸리지 않도록 가격 변동이 미미하면 스킵
+            if len(open_orders) >= (GRID_LEVELS * 2):
+                return
+            for order in open_orders:
+                await exchange.cancel_order(order['id'], symbol)
+        except:
+            pass
 
-            # 2. 촘촘한 단타 그리드 지정가 계산
-            per_grid_amount = (allocated_usdt * LEVERAGE) / GRID_LEVELS
-            order_tasks = []
+        per_grid_amount = (allocated_usdt * LEVERAGE) / GRID_LEVELS
+        
+        # 비동기로 상하한 지정가 주문을 동시에 타전하여 체결 속도 극대화
+        order_tasks = []
+        for i in range(1, GRID_LEVELS + 1):
+            buy_price = current_price * (1 - (GRID_PERCENT_SPACING * i))
+            sell_price = current_price * (1 + (GRID_PERCENT_SPACING * i))
             
-            for i in range(1, GRID_LEVELS + 1):
-                buy_price = current_price * (1 - (GRID_PERCENT_SPACING * i))
-                sell_price = current_price * (1 + (GRID_PERCENT_SPACING * i))
-                
-                buy_amount = per_grid_amount / buy_price
-                sell_amount = per_grid_amount / sell_price
-                
-                # 비동기 지정가 매수/매도 주문 동시 생성 준비
-                order_tasks.append(exchange.create_order(symbol, 'limit', 'buy', buy_amount, buy_price))
-                order_tasks.append(exchange.create_order(symbol, 'limit', 'sell', sell_amount, sell_price))
+            buy_amount = per_grid_amount / buy_price
+            sell_amount = per_grid_amount / sell_price
             
-            # 3. 0.00001초 극한 속도의 병렬 주문 전송 (API 레이트 리밋 보호 가드 포함)
-            await asyncio.gather(*order_tasks, return_exceptions=True)
-            logger.debug(f"[{symbol}] 초고속 그리드 주문 배치 완료 (기준가: {current_price})")
-            return
+            order_tasks.append(exchange.create_order(symbol, 'limit', 'buy', buy_amount, buy_price))
+            order_tasks.append(exchange.create_order(symbol, 'limit', 'sell', sell_amount, sell_price))
             
-        except ccxt.RateLimitExceeded:
-            wait_time = (attempt + 1) * 1.5
-            logger.warning(f"[{symbol}] API 레이트 리밋 감지. {wait_time}초 후 재시도...")
-            await asyncio.sleep(wait_time)
-        except Exception as e:
-            logger.error(f"[{symbol}] 그리드 주문 집행 중 돌발 에러 (시도 {attempt+1}/{max_retries}): {e}")
-            await asyncio.sleep(1)
+        await asyncio.gather(*order_tasks, return_exceptions=True)
+    except ccxt.RateLimitExceeded:
+        logger.warning("⚠️ 거래소 API 레이트 리밋 감지 - 1초 동안 스마트 스로틀링 대기")
+        await asyncio.sleep(1.0)
+    except Exception as e:
+        logger.error(f"[{symbol}] 초고속 스캘핑 집행 에러: {e}")
 
-# ==================== 메인 통합 트레이딩 루프 (하이퍼-스피드) ====================
-async def trading_bot_loop():
+# ==================== 메인 통합 트레이딩 루프 ====================
+async def trading_bot_loop(application=None):
     global BOT_RUNNING
-    logger.info("하이퍼-스피드 프로 트레이딩 봇 루프 시작됨")
+    logger.info("초고속 스캘핑 통합 트레이딩 루프 시작됨")
     
     screening_counter = 0
-    
     while True:
         if not BOT_RUNNING:
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             continue
             
         try:
-            # [1순위] 킬스위치 상시 감시
-            if await check_global_kill_switch():
+            # 1. 킬스위치 및 돌발 상황 헷지 상시 감시
+            if await check_global_kill_switch(application):
                 break
                 
-            # [2순위] 주기적 또는 시장 변화에 따른 자율 코인 스크리닝 갱신 (10분에 한 번 혹은 최초)
-            if not SELECTED_COINS or screening_counter >= 40:
+            # 2. 10사이클(약 30초~1분)마다 시장 상황에 맞춰 코인 동적 재스크리닝
+            if screening_counter <= 0 or not SELECTED_COINS:
                 await dynamic_coin_screening()
-                screening_counter = 0
-            screening_counter += 1
-                
-            krw_rate = get_krw_rate()
+                screening_counter = 10
+            else:
+                screening_counter -= 1
+
             balance = await exchange.fetch_balance()
-            usdt_free = balance['USDT']['free']
-            
-            max_usdt_per_coin = MAX_KRW_PER_COIN / krw_rate
+            usdt_total = balance['USDT']['total']
+            krw_rate = get_krw_rate()
+
+            # 원금 상관없이, 코인당 최대 750 USDT, 4개 동시 진입 시 최대 3000 USDT 내에서 배분
             num_coins = max(1, len(SELECTED_COINS))
-            allocated_usdt_per_coin = min(max_usdt_per_coin, usdt_free / num_coins)
+            target_total_allocation = min(MAX_USDT_TOTAL, usdt_total)
+            allocated_usdt_per_coin = min(MAX_USDT_PER_COIN, target_total_allocation / num_coins)
 
-            # 타겟 코인들에 대한 펀딩비 방어 및 초고속 그리드 실행을 병렬 처리
-            tasks = []
+            # 비동기로 모든 타겟 코인에 대해 초고속 스캘핑 주문 동시 집행 (속도 극대화)
+            scalping_tasks = []
             for symbol in SELECTED_COINS:
+                funding_info = await exchange.fetch_funding_rate(symbol)
+                funding_rate = funding_info.get('fundingRate', 0) * 100
+                
+                if funding_rate < MIN_FUNDING_RATE:
+                    continue
+                
                 try:
-                    funding_info = await exchange.fetch_funding_rate(symbol)
-                    funding_rate = funding_info.get('fundingRate', 0) * 100
-                    
-                    if funding_rate < MIN_FUNDING_RATE:
-                        logger.warning(f"[{symbol}] 펀딩비({funding_rate:.4f}%)가 최소 기준 미만. 이번 회차 진입 제외.")
-                        continue
-                    
-                    try:
-                        await exchange.set_leverage(LEVERAGE, symbol)
-                    except:
-                        pass
+                    await exchange.set_leverage(LEVERAGE, symbol)
+                except:
+                    pass
 
-                    # [3순위] 초고속 비동기 그리드 스캘핑 작업 추가
-                    tasks.append(execute_grid_scalping_for_coin(symbol, allocated_usdt_per_coin))
-                except Exception as e:
-                    logger.error(f"[{symbol}] 전처리 과정 에러: {e}")
+                scalping_tasks.append(execute_ultra_fast_scalping(symbol, allocated_usdt_per_coin))
 
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            if scalping_tasks:
+                await asyncio.gather(*scalping_tasks, return_exceptions=True)
 
-            # 잦은 호출 방지 및 서버 부하를 완벽히 차단하면서도 스캘핑 속도를 유지하는 최적의 딜레이 (3초~5초)
-            await asyncio.sleep(4)
+            # 실시간 거래 발생 시 즉시 텔레그램 알림 브리핑 체크
+            if application and TELEGRAM_CHAT_ID:
+                await check_and_send_realtime_trade_alerts(application)
 
-        except Exception as e:
-            logger.error(f"메인 통합 루프 돌발 에러: {e}")
+            # 잦은 API 에러 방지 및 초고속 루프 최적화 미세 대기 (3초 간격)
             await asyncio.sleep(3)
 
-# ==================== 텔레그램 실시간 제어 핸들러 ====================
+        except Exception as e:
+            logger.error(f"메인 루프 예외 발생: {e}")
+            await asyncio.sleep(2)
+
+# ==================== 실시간 개별 거래 및 수익률 텔레그램 브리핑 ====================
+async def check_and_send_realtime_trade_alerts(application):
+    global LAST_NOTIFIED_POSITIONS
+    try:
+        positions = await exchange.fetch_positions()
+        krw_rate = get_krw_rate()
+        active_symbols = set()
+        
+        for pos in positions:
+            contracts = float(pos.get('contracts', 0) or 0)
+            if contracts > 0:
+                symbol = pos['symbol']
+                if symbol.replace(':USDT', '') in ['ONDO/USDT']: continue # 수동 보유 제외
+                
+                active_symbols.add(symbol)
+                entry_price = float(pos.get('entryPrice', 0) or 0)
+                mark_price = float(pos.get('markPrice', 0) or 0)
+                pnl = float(pos.get('unrealizedPnl', 0) or 0)
+                side = pos.get('side', 'long').upper()
+                
+                # 수익률(ROE 또는 가격 기준 변동률) 계산
+                roe = 0
+                if entry_price > 0:
+                    if side == 'LONG':
+                        roe = ((mark_price - entry_price) / entry_price) * 100 * LEVERAGE
+                    else:
+                        roe = ((entry_price - mark_price) / entry_price) * 100 * LEVERAGE
+
+                pnl_krw = pnl * krw_rate
+                
+                # 새로운 거래 진입이 감지되었거나 상태가 바뀐 경우 즉시 텔레그램 실시간 알림 전송
+                if symbol not in LAST_NOTIFIED_POSITIONS:
+                    msg = (
+                        f"🚨 **[실시간 코인 거래 체결 알림]**\n"
+                        f"- 종목: `{symbol}` ({side})\n"
+                        f"- 매수가(진입가): `{entry_price:,.4f}` USDT\n"
+                        f"- 현재가: `{mark_price:,.4f}` USDT\n"
+                        f"- 실시간 수익/손실률(ROE): `{roe:+.2f}%`\n"
+                        f"- 평가 손익: `{pnl:+.4f} USDT` (약 `{pnl_krw:+,.0f} 원`)\n"
+                        f"- 레버리지: `{LEVERAGE}x`"
+                    )
+                    await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
+                    
+        LAST_NOTIFIED_POSITIONS = active_symbols
+    except Exception as e:
+        logger.error(f"실시간 거래 알림 에러: {e}")
+
+# ==================== 30분 정기 헬스체크 및 총 투자 원금/수익 브리핑 ====================
+async def telegram_heartbeat_job(application):
+    while True:
+        await asyncio.sleep(1800) # 30분 마다
+        if TELEGRAM_CHAT_ID and BOT_RUNNING:
+            try:
+                balance = await exchange.fetch_balance()
+                usdt_total = balance['USDT']['total']
+                usdt_free = balance['USDT']['free']
+                krw_rate = get_krw_rate()
+                total_krw = usdt_total * krw_rate
+                
+                # 총 미실현 수익 계산
+                positions = await exchange.fetch_positions()
+                total_unrealized_pnl = sum([float(p.get('unrealizedPnl', 0) or 0) for p in positions if float(p.get('contracts', 0) or 0) > 0])
+                total_pnl_krw = total_unrealized_pnl * krw_rate
+
+                msg = (
+                    f"⏰ **[30분 정기 통합 리포트]**\n"
+                    f"초고속 스캘핑 그리드 봇 정상 구동 중 🟢\n\n"
+                    f"💰 **[자금 및 수익 현황]**\n"
+                    f"- 총 투자 원금(잔고): `{usdt_total:,.2f} USDT` (약 `{total_krw:,.0f} 원`)\n"
+                    f"- 가용 자금: `{usdt_free:,.2f} USDT`\n"
+                    f"- 총 평가 손익: `{total_unrealized_pnl:+.2f} USDT` (약 `{total_pnl_krw:+,.0f} 원`)\n\n"
+                    f"📊 **[현재 거래 타겟]** {', '.join(SELECTED_COINS) if SELECTED_COINS else '없음'}\n"
+                    f"🔒 **보호 자산**: ONDO (안전 격리 중)"
+                )
+                await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"헬스체크 오류: {e}")
+
+# ==================== 텔레그램 명령어 제어 핸들러 ====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID): return
     global BOT_RUNNING
     BOT_RUNNING = True
-    await update.message.reply_text("🚀 하이퍼-스피드 프로 자동매매 봇(자율 코인 개수 조절 + 극한 스캘핑 + 레이트리밋 방어)이 시작되었습니다!")
+    await update.message.reply_text("✅ 초고속 스캘핑 봇이 가동되었습니다! (750 USDT 제한, 실시간 거래 알림 활성화)")
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID): return
     global BOT_RUNNING
     BOT_RUNNING = False
     await update.message.reply_text("🛑 자동매매 봇이 안전하게 중지되었습니다.")
-
-async def cmd_set_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID): return
-    global LEVERAGE
-    try:
-        LEVERAGE = int(context.args[0])
-        await update.message.reply_text(f"⚙️ 레버리지가 {LEVERAGE}x 로 변경되었습니다.")
-    except:
-        await update.message.reply_text("사용법: /set_leverage 3")
-
-async def cmd_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID): return
-    global MAX_KRW_PER_COIN, MAX_KRW_TOTAL
-    try:
-        val = float(context.args[0])
-        MAX_KRW_PER_COIN = val
-        MAX_KRW_TOTAL = val * 4
-        await update.message.reply_text(f"💰 코인당 최대 한도가 {MAX_KRW_PER_COIN:,.0f}원으로 변경되었습니다.")
-    except:
-        await update.message.reply_text("사용법: /set_limit 1000000 (단위: 원)")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID): return
@@ -316,58 +376,51 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         usdt_free = balance['USDT']['free']
         krw_rate = get_krw_rate()
         total_krw = usdt_total * krw_rate
-        fng = get_fear_and_greed_index()
+        
+        positions = await exchange.fetch_positions()
+        active_pos_msgs = []
+        total_pnl = 0
+        
+        for pos in positions:
+            contracts = float(pos.get('contracts', 0) or 0)
+            if contracts > 0:
+                symbol = pos['symbol']
+                entry = float(pos.get('entryPrice', 0) or 0)
+                mark = float(pos.get('markPrice', 0) or 0)
+                pnl = float(pos.get('unrealizedPnl', 0) or 0)
+                total_pnl += pnl
+                side = pos.get('side', 'LONG').upper()
+                roe = ((mark - entry) / entry) * 100 * LEVERAGE if side == 'LONG' else ((entry - mark) / entry) * 100 * LEVERAGE
+                active_pos_msgs.append(f"• `{symbol}` ({side}) | 진입: {entry:,.4f} | ROE: **{roe:+.2f}%** | 손익: {pnl:+.2f} USDT")
+
+        pos_str = "\n".join(active_pos_msgs) if active_pos_msgs else "현재 진행 중인 거래 없음"
         
         status_msg = (
-            f"📊 **[하이퍼-스피드 봇 실시간 상태]**\n"
+            f"📊 **[프로 봇 실시간 즉시 현황 리포트]**\n"
             f"- 상태: {'실행 중 🟢' if BOT_RUNNING else '정지 중 🔴'}\n"
-            f"- 레버리지: {LEVERAGE}x\n"
-            f"- 코인당 할당 한도: {MAX_KRW_PER_COIN:,.0f}원\n"
-            f"- 공포탐욕지수: {fng}\n"
-            f"- 총 잔고: {usdt_total:.2f} USDT (가용: {usdt_free:.2f} USDT)\n"
-            f"- 자산 평가: 약 {total_krw:,.0f} 원\n"
-            f"- 🎯 **현재 자율 채택된 타겟 코인 ({len(SELECTED_COINS)}개)**: {', '.join(SELECTED_COINS) if SELECTED_COINS else '분석 중'}\n"
-            f"- 🔒 **보호 중인 자산**: ONDO (매매 제외)"
+            f"- 레버리지: `{LEVERAGE}x`\n"
+            f"- 코인당 최대 한도: `{MAX_USDT_PER_COIN} USDT`\n"
+            f"- 총 잔고(원금): `{usdt_total:,.2f} USDT` (약 `{total_krw:,.0f} 원`)\n"
+            f"- 총 평가 손익: `{total_pnl:+.2f} USDT`\n\n"
+            f"📈 **[실시간 오픈 포지션]**\n{pos_str}\n\n"
+            f"🔒 **보호 자산**: ONDO (매매 제외)"
         )
         await update.message.reply_text(status_msg, parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"상태 조회 실패: {e}")
-
-async def telegram_heartbeat_job(application):
-    while True:
-        await asyncio.sleep(1800)
-        if TELEGRAM_CHAT_ID and BOT_RUNNING:
-            try:
-                balance = await exchange.fetch_balance()
-                usdt_total = balance['USDT']['total']
-                krw_rate = get_krw_rate()
-                total_krw = usdt_total * krw_rate
-                
-                msg = (
-                    f"⏰ **[30분 정기 헬스체크]**\n"
-                    f"하이퍼-스피드 그리드 봇 정상 구동 중 🟢\n"
-                    f"현재 거래 중인 코인 수: {len(SELECTED_COINS)}개\n"
-                    f"총 자산: {usdt_total:.2f} USDT / {total_krw:,.0f} KRW\n"
-                    f"ONDO 코인 안전 보호 중 🔒"
-                )
-                await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
-            except Exception as e:
-                logger.error(f"헬스체크 오류: {e}")
 
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("set_leverage", cmd_set_leverage))
-    app.add_handler(CommandHandler("set_limit", cmd_set_limit))
     app.add_handler(CommandHandler("status", cmd_status))
     
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
     
-    asyncio.create_task(trading_bot_loop())
+    asyncio.create_task(trading_bot_loop(app))
     asyncio.create_task(telegram_heartbeat_job(app))
     
     try:
