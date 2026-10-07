@@ -41,7 +41,7 @@ MAX_USDT_TOTAL = 3000.0
 GRID_PERCENT_SPACING = 0.002  # 0.2% 간격
 GRID_LEVELS = 3               
 
-# 🛡️ [최종 해결] CCXT 공식 표준 okx 객체 생성 (재설치된 최신 환경에 완벽 대응)
+# 🛡️ [완벽 해결] CCXT 공식 표준 okx 객체 생성 (가장 안전한 방식)
 exchange = ccxt.okx({
     'apiKey': OKX_API_KEY,
     'secret': OKX_SECRET_KEY,
